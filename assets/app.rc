@@ -1,0 +1,4 @@
+1 ICON "icon.ico"
+
+// 24 = RT_MANIFEST：显式声明 asInvoker，保证任何情况下都不触发 UAC 提权
+1 24 "app.manifest"

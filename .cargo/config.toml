@@ -1,0 +1,4 @@
+# windows-gnu：强制使用 rust 自带的 self-contained CRT/导入库链接，
+# 避免依赖系统 MinGW 的链接路径（系统 MinGW 仅用于 dlltool 的 as、cc 的 gcc、embed-resource 的 windres）。
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-self-contained=yes"]

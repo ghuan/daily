@@ -1,0 +1,40 @@
+[package]
+name = "bell-reminder"
+version = "0.3.0"
+edition = "2021"
+build = "build.rs"
+description = "小铃：按日期管理计划与提醒的 Windows 小工具"
+
+[dependencies]
+anyhow = "1"
+auto-launch = "0.5"
+chrono = { version = "0.4", features = ["serde"] }
+eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "accesskit", "persistence"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tray-icon = "0.19"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_Media_Audio",
+    "Win32_Graphics_Dwm",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+embed-resource = "2"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+panic = "abort"
+

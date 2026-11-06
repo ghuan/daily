@@ -1,0 +1,25 @@
+# ---- Rust 编译产物 ----
+/target
+**/*.rs.bk
+
+# ---- 运行时数据（含用户计划与明文凭据，绝不入库）----
+# 数据目录跟着 exe 走，构建产物旁边会生成 bell-data
+**/bell-data/
+# 隔离测试用的数据目录
+**/daily-reminder-data/
+
+# ---- 临时 / 调试文件 ----
+/tmp
+*.tmp
+*.log
+*.bak
+*.bak-*
+__pycache__/
+*.pyc
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

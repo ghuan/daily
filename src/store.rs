@@ -523,47 +523,6 @@ impl GitStore {
     }
 
 
-    /// 只探测远端：`fetch` 并比较远端分支与本地 HEAD 的时间与领先关系。
-    ///
-    /// 返回：
-    ///  - `None`：远端还没有数据分支
-    ///  - Some(false)：可以直接拉取（纯落后、一致、或本机纯领先，都不会丢改动）
-    ///  - Some(true)：**真分叉**——本机与远端各有对方没有的提交，拉取会覆盖本机
-    ///
-    /// 「纯落后」（local_ahead=0, remote_ahead>0）是最常见的多机场景：另一台
-    /// 推了新数据，本机什么都没动。此时拉取完全无损，必须直接拉，否则用户点
-    /// 「立即同步」会卡在确认条上（而确认条若被弹窗挡住就永远同步不到）。
-    ///
-    /// 注意：这只做 `fetch`（写中转副本的 `.git`），**不**改工作区、不动本地数据。
-    pub fn probe_remote(&self) -> Result<Option<bool>> {
-        self.prepare()?;
-        let branch = self.cfg.branch.trim();
-        if self
-            .run(&["rev-parse", "--verify", &format!("origin/{branch}")])
-            .is_err()
-        {
-            return Ok(None);
-        }
-        self.run(&["fetch", "origin", branch])?;
-        let remote = format!("origin/{branch}");
-        // 本地 HEAD 不存在（首次）→ 远端任何东西都算「新」，但同样没有本地改动要保护
-        if self.run(&["rev-parse", "--verify", branch]).is_err() {
-            return Ok(Some(false));
-        }
-        // 双向计数：左 = 本地领先，右 = 远端领先
-        let out = self.run(&[
-            "rev-list",
-            "--left-right",
-            "--count",
-            &format!("{branch}...{remote}"),
-        ])?;
-        let mut parts = out.split_whitespace();
-        let local_ahead = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-        let remote_ahead = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-        // 只有「两边都领先」才是会丢改动的真冲突
-        Ok(Some(local_ahead > 0 && remote_ahead > 0))
-    }
-
     /// 从远端拉取数据到中转副本，并返回远端数据在副本里的**目录**。
     ///
     /// 返回 `None` = 远端还没有数据（目录不存在且旧单文件也不存在）。
@@ -674,6 +633,92 @@ impl GitStore {
         Ok(())
     }
 
+    /// 一轮「拉取 + 推送」的智能同步。
+    ///
+    /// 与 `push_dir`（无脑用本地覆盖远端）不同，这里先**分别探测**两边：
+    ///
+    /// | 本地有改动 | 远端有新提交 | 动作 |
+    /// |---|---|---|
+    /// | ✗ | ✗ | `Noop` |
+    /// | ✓ | ✗ | 直接推送（`Pushed`） |
+    /// | ✗ | ✓ | 中转副本对齐远端，返回 `Pulled`（调用方写回本地） |
+    /// | ✓ | ✓ | **`Conflict`** —— 没有合并能力，整份覆盖必然丢一边，交给用户选 |
+    ///
+    /// 为什么不「先 pull 再 push」：延迟队列的消息本身就意味着本地有未推送
+    /// 改动，先 pull 会用远端全量数据把它冲掉（实测踩过：勾选的完成状态
+    /// 被悄悄还原）。数据层是「整份覆盖」模型，拉和推不能同时成立。
+    pub fn sync_round(&self, local_dir: &Path, message: &str) -> Result<SyncOutcome> {
+        self.prepare()?;
+        let branch = self.cfg.branch.trim().to_string();
+        let dest = self.remote_dir();
+
+        // ---- 探测远端 ----
+        let has_remote = self
+            .run(&["rev-parse", "--verify", &format!("origin/{branch}")])
+            .is_ok();
+        let mut remote_ahead: u64 = 0;
+        if has_remote {
+            self.run(&["fetch", "origin", &branch])?;
+            if self.run(&["rev-parse", "--verify", &branch]).is_ok() {
+                let out = self.run(&["rev-list", "--count", &format!("{branch}..origin/{branch}")])?;
+                remote_ahead = out.trim().parse().unwrap_or(0);
+            } else {
+                // 本地分支还不存在：远端的一切内容都算"新"
+                remote_ahead = 1;
+            }
+        }
+
+        // ---- 探测本地：把本地数据拷进副本（先不提交），看有没有差异 ----
+        let _ = std::fs::remove_dir_all(&dest);
+        std::fs::create_dir_all(&dest)
+            .with_context(|| format!("创建目录失败：{}", dest.display()))?;
+        if local_dir.is_dir() {
+            copy_dir_contents(local_dir, &dest)?;
+        }
+        let _ = std::fs::remove_file(dest.join(DOC_INDEX_FILE_LEGACY));
+        self.run(&["add", "-A"])?;
+        let local_dirty = !self
+            .run(&["status", "--porcelain"])?
+            .trim()
+            .is_empty();
+
+        match (local_dirty, remote_ahead > 0) {
+            (false, false) => Ok(SyncOutcome::Noop),
+            (true, false) => {
+                self.commit_and_push(&branch, message)?;
+                Ok(SyncOutcome::Pushed)
+            }
+            (false, true) => {
+                // 纯落后：副本对齐远端，内容即远端数据
+                self.run(&["reset", "--hard", &format!("origin/{branch}")])?;
+                Ok(SyncOutcome::Pulled)
+            }
+            (true, true) => {
+                // 冲突：恢复副本到远端状态（干净），等用户决定
+                self.run(&["reset", "--hard", &format!("origin/{branch}")])?;
+                Ok(SyncOutcome::Conflict)
+            }
+        }
+    }
+
+    /// `sync_round` 的后半段：提交已暂存的改动并推送。
+    fn commit_and_push(&self, branch: &str, message: &str) -> Result<()> {
+        self.run(&[
+            "-c",
+            "user.name=bell-reminder",
+            "-c",
+            "user.email=daily@local",
+            "commit",
+            "-m",
+            message,
+        ])?;
+        if self.run(&["rev-parse", "--verify", branch]).is_err() {
+            self.run(&["checkout", "-B", branch])?;
+        }
+        self.run(&["push", "origin", &format!("HEAD:{branch}")])?;
+        Ok(())
+    }
+
     fn run(&self, args: &[&str]) -> Result<String> {
         self.run_in(&self.dir, args)
     }
@@ -743,6 +788,20 @@ fn redact(text: &str, cfg: &GitConfig) -> String {
         s = s.replace(&urlencode(&cfg.password), "***");
     }
     s
+}
+
+/// 一轮完整同步的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// 本地有改动且远端无新内容：已推送。
+    Pushed,
+    /// 本地无改动且远端有新内容：中转副本已对齐到远端，
+    /// 调用方需要把远端内容写回本地数据目录并重新读盘。
+    Pulled,
+    /// 两边都有改动：需要用户决定覆盖方向，什么都没动。
+    Conflict,
+    /// 两边都没有改动。
+    Noop,
 }
 
 /// 用 `from` 目录的内容**整体替换** `to` 目录的内容。
@@ -1210,7 +1269,135 @@ mod tests {
         store.push_dir(local.dir(), "second").unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
+
+    /// `sync_round` 四象限：本机无改动 + 远端无新内容 → Noop。
+    #[test]
+    fn sync_round_noop() {
+        use crate::model::DayRecord;
+        if !git_available() { return; }
+        let base = temp_dir();
+        let remote = base.join("remote.git");
+        git_ok(&base, &["init", "--bare", &remote.to_string_lossy()]);
+        let cfg = GitConfig { url: remote.to_string_lossy().into_owned(), branch: "main".into(), path: DOC_DIR_NAME.into(), ..Default::default() };
+        let local = DocStore::new(base.join("local-plans"));
+        local.save(&Doc::default()).unwrap();
+        let store = GitStore::new(base.join("w"), cfg);
+        store.prepare().unwrap();
+        // 先推一次建立远端
+        store.push_dir(local.dir(), "init").unwrap();
+        // 无任何变化
+        assert_eq!(store.sync_round(local.dir(), "x").unwrap(), SyncOutcome::Noop);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `sync_round` 四象限：本机有改动 + 远端无新内容 → 直接 Pushed。
+    #[test]
+    fn sync_round_pushes_local_changes() {
+        use crate::model::DayRecord;
+        if !git_available() { return; }
+        let base = temp_dir();
+        let remote = base.join("remote.git");
+        git_ok(&base, &["init", "--bare", &remote.to_string_lossy()]);
+        let cfg = GitConfig { url: remote.to_string_lossy().into_owned(), branch: "main".into(), path: DOC_DIR_NAME.into(), ..Default::default() };
+        let local = DocStore::new(base.join("local-plans"));
+        local.save(&Doc::default()).unwrap();
+        let store = GitStore::new(base.join("w"), cfg.clone());
+        store.prepare().unwrap();
+        store.push_dir(local.dir(), "init").unwrap();
+
+        // 本地加一条记录（模拟延迟队列里的未推送改动）
+        let t = Plan::new("本机改动".into(), String::new(), NaiveTime::from_hms_opt(9,0,0).unwrap());
+        let mut doc = local.load().unwrap();
+        doc.records.push(DayRecord::from_template(&t, chrono::NaiveDate::from_ymd_opt(2026,11,7).unwrap()));
+        local.save(&doc).unwrap();
+
+        assert_eq!(store.sync_round(local.dir(), "push local").unwrap(), SyncOutcome::Pushed);
+        // 远端应包含本机改动
+        let check = GitStore::new(base.join("check"), cfg.clone());
+        let dir = check.fetch_remote_dir().unwrap().expect("远端应有数据");
+        let text = std::fs::read_to_string(dir.join("2026.json")).unwrap();
+        assert!(text.contains("本机改动"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `sync_round` 四象限：本机无改动 + 远端有新内容 → Pulled（副本=远端内容）。
+    #[test]
+    fn sync_round_pulls_remote_only() {
+        use crate::model::DayRecord;
+        if !git_available() { return; }
+        let base = temp_dir();
+        let remote = base.join("remote.git");
+        git_ok(&base, &["init", "--bare", &remote.to_string_lossy()]);
+        let cfg = GitConfig { url: remote.to_string_lossy().into_owned(), branch: "main".into(), path: DOC_DIR_NAME.into(), ..Default::default() };
+
+        // 本机：推一个空数据基线
+        let local = DocStore::new(base.join("local-plans"));
+        local.save(&Doc::default()).unwrap();
+        let store = GitStore::new(base.join("w"), cfg.clone());
+        store.prepare().unwrap();
+        store.push_dir(local.dir(), "baseline").unwrap();
+
+        // 「另一台电脑」在本机基线之上推入新内容（使远端领先本机提交）
+        let other_local = DocStore::new(base.join("other-plans"));
+        let t = Plan::new("远端新增".into(), String::new(), NaiveTime::from_hms_opt(9,0,0).unwrap());
+        let mut rdoc = Doc::default();
+        rdoc.records.push(DayRecord::from_template(&t, chrono::NaiveDate::from_ymd_opt(2026,11,7).unwrap()));
+        other_local.save(&rdoc).unwrap();
+        let other = GitStore::new(base.join("other"), cfg);
+        other.prepare().unwrap();
+        other.push_dir(other_local.dir(), "other push").unwrap();
+
+        assert_eq!(store.sync_round(local.dir(), "x").unwrap(), SyncOutcome::Pulled);
+        // 副本对齐到远端后应包含「远端新增」
+        let text = std::fs::read_to_string(store.remote_dir().join("2026.json")).unwrap();
+        assert!(text.contains("远端新增"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `sync_round` 四象限：两边都有改动 → Conflict，且两边数据都没被破坏。
+    #[test]
+    fn sync_round_reports_conflict_without_touching_data() {
+        use crate::model::DayRecord;
+        if !git_available() { return; }
+        let base = temp_dir();
+        let remote = base.join("remote.git");
+        git_ok(&base, &["init", "--bare", &remote.to_string_lossy()]);
+        let cfg = GitConfig { url: remote.to_string_lossy().into_owned(), branch: "main".into(), path: DOC_DIR_NAME.into(), ..Default::default() };
+
+        let local = DocStore::new(base.join("local-plans"));
+        local.save(&Doc::default()).unwrap();
+        let store = GitStore::new(base.join("w"), cfg.clone());
+        store.prepare().unwrap();
+        store.push_dir(local.dir(), "baseline").unwrap();
+
+        // 远端新增（另一台电脑）
+        let other_local = DocStore::new(base.join("other-plans"));
+        let t = Plan::new("远端改动".into(), String::new(), NaiveTime::from_hms_opt(9,0,0).unwrap());
+        let mut doc = Doc::default();
+        doc.records.push(DayRecord::from_template(&t, chrono::NaiveDate::from_ymd_opt(2026,11,7).unwrap()));
+        other_local.save(&doc).unwrap();
+        let other = GitStore::new(base.join("other"), cfg.clone());
+        other.prepare().unwrap();
+        other.push_dir(other_local.dir(), "other push").unwrap();
+
+        // 本地也新增（延迟队列场景）
+        let t2 = Plan::new("本机改动".into(), String::new(), NaiveTime::from_hms_opt(10,0,0).unwrap());
+        let mut ldoc = local.load().unwrap();
+        ldoc.records.push(DayRecord::from_template(&t2, chrono::NaiveDate::from_ymd_opt(2026,11,7).unwrap()));
+        local.save(&ldoc).unwrap();
+
+        assert_eq!(store.sync_round(local.dir(), "x").unwrap(), SyncOutcome::Conflict);
+
+        // 冲突后两边数据都应完好：远端有「远端改动」，本地文件有「本机改动」
+        let check = GitStore::new(base.join("check"), cfg.clone());
+        let dir = check.fetch_remote_dir().unwrap().unwrap();
+        assert!(std::fs::read_to_string(dir.join("2026.json")).unwrap().contains("远端改动"));
+        assert!(std::fs::read_to_string(base.join("local-plans").join("2026.json")).unwrap().contains("本机改动"));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }
+
+
 
 
 

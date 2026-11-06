@@ -602,14 +602,32 @@ impl GitStore {
 
     /// 把本地 `plans/` 目录的内容整体推送到远端。
     ///
-    /// 做法：清掉中转副本里的数据目录 → 拷入本地目录 → add/commit/push。
-    /// 这样远端内容永远等于本地真实数据，不受副本残留影响，也能正确处理
-    /// 「某个年份文件被删除」这种情况（否则 git 会保留旧文件）。
+    /// 做法（顺序很关键）：
+    ///  1. **先把中转副本对齐到远端最新**（`fetch` + `reset --hard origin/<branch>`）；
+    ///  2. 再把本地目录拷进去、提交、推送。
+    ///
+    /// 为什么必须先对齐：另一台电脑可能已经推了新提交，而本机中转副本还停在旧
+    /// HEAD 上并领先几个本地提交 —— 两边分叉，`git push` 会被拒绝（non-fast-forward），
+    /// 用户看到「同步失败：git push origin HEAD:plans 失败」。中转副本是纯桥梁，
+    /// 它里面那些「中间提交」的内容在本地 `plans/` 里都还有（每次改动都先写本地），
+    /// 丢弃它们不会丢数据；重新基于远端 HEAD 生成一次提交即可保证 fast-forward。
     pub fn push_dir(&self, local_dir: &Path, message: &str) -> Result<()> {
         self.prepare()?;
         let branch = self.cfg.branch.trim().to_string();
         let dest = self.remote_dir();
 
+        // ---- 第 1 步：对齐远端（只在远端已有该分支时） ----
+        let has_remote_branch = self
+            .run(&["rev-parse", "--verify", &format!("origin/{branch}")])
+            .is_ok();
+        if has_remote_branch {
+            self.run(&["fetch", "origin", &branch])?;
+            // 丢掉副本里所有未提交改动与本地中间提交，完全对齐远端。
+            // 用户数据不在这里（在 bell-data/plans/），删了不会丢。
+            self.run(&["reset", "--hard", &format!("origin/{branch}")])?;
+        }
+
+        // ---- 第 2 步：把本地真实数据写进（已对齐的）中转副本 ----
         if local_dir.is_dir() {
             // 先删干净再拷：保证远端不会残留本地已删除的年份文件
             let _ = std::fs::remove_dir_all(&dest);

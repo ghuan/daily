@@ -138,17 +138,16 @@ cargo +stable-x86_64-pc-windows-gnu build --release --target x86_64-pc-windows-g
 
 ### 建议：数据单独放一个私有仓库
 
-代码可以公开，个人计划不该公开。推荐建两个仓库：
+代码可以公开，个人计划不该公开。推荐建一个**私有仓库专门放数据**，而不是塞进代码仓库：
 
 ```
-ghuan/daily        公开   源代码
-ghuan/daily-plans  私有   只放 plans.json
+<你的账号>/<某个私有仓库>    只放 plans.json
 ```
 
-设置页指向数据仓库即可 —— **分支可以不是 `main`**：
+设置页指向这个仓库即可 —— **分支可以不是 `main`**：
 
 ```
-仓库地址：       https://github.com/<你>/daily-plans.git
+仓库地址：       https://github.com/<你>/<私有仓库>.git
 密码 / 访问令牌： <PAT>
 分支：           plans
 数据文件：       plans.json
@@ -247,18 +246,3 @@ GUI 使用 **egui / eframe 0.37**（glow 后端）。选这个版本是因为它
 ## 许可
 
 [MIT](LICENSE) © 2026 ghuan
-
----
-
-## 关于数据仓库
-
-本项目**代码**与**个人数据**是分开的两个仓库：
-
-| 仓库 | 可见性 | 内容 |
-|---|---|---|
-| `ghuan/daily` | 公开 | 源代码 |
-| `ghuan/daily-plans` | **私有** | 仅 `plans.json`（个人计划数据） |
-
-如果你 fork 了这个项目，请把同步目标指向**你自己的私有仓库**，不要指向本项目的任何分支。
-
-> ⚠️ 计划数据里可能包含作息习惯、就医记录、工作内容等敏感信息。除非你明确知道自己在做什么，否则**不要把 `plans.json` 推到公开仓库**。

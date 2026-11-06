@@ -1278,6 +1278,9 @@ impl PlanApp {
                                 if let Ok(doc) = backend.load() {
                                     self.doc = doc;
                                     self.popups.clear();
+                                    // 立刻重绘，别等下一次 1 秒 tick —— 用户点「立即同步」
+                                    // 后要马上看到卡片状态变化（勾变绿）。
+                                    request_ui_wake();
                                 }
                             }
                         }

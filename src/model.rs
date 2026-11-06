@@ -666,6 +666,126 @@ pub fn fmt_time(t: NaiveTime) -> String {
     t.format("%H:%M").to_string()
 }
 
+// ============================== 按年拆分 ==============================
+//
+// 数据量随年份线性增长（每天 3 条 ≈ 每年 600 KB），单个 plans.json 会越来越臃肿：
+// 每次保存都要整份序列化重写，Git 里也会变成一份不断膨胀的不可 diff 的巨型文件。
+//
+// 于是把**记录**按 `date.year()` 拆成多个文件，模板与标签留在索引文件里：
+//
+//   plans/plans.json      索引：version / templates / tags / years
+//   plans/2026.json       该年的所有 records
+//   plans/2027.json
+//
+// 内存里仍然是一个完整的 `Doc`（界面代码完全不用改），只在读写磁盘时做拆分。
+
+/// 索引文件：不放 records，只放随年份不变的元数据 + 已有年份清单。
+#[derive(Debug, Serialize, Deserialize)]
+struct YearIndex {
+    #[serde(default = "two")]
+    version: u32,
+    #[serde(default, rename = "plans", skip_serializing)]
+    legacy_templates: Vec<Plan>,
+    #[serde(default)]
+    templates: Vec<Plan>,
+    #[serde(default)]
+    tags: Vec<String>,
+    /// 本目录下有哪些年份文件（排序后便于人工阅读与 diff）。
+    #[serde(default)]
+    years: Vec<i32>,
+}
+
+impl Default for YearIndex {
+    fn default() -> Self {
+        Self {
+            version: 2,
+            legacy_templates: Vec::new(),
+            templates: Vec::new(),
+            tags: Vec::new(),
+            years: Vec::new(),
+        }
+    }
+}
+
+/// 单个年份文件：只装这一年（含当年跨年记录）的 records。
+#[derive(Debug, Serialize, Deserialize)]
+struct YearRecords {
+    #[serde(default = "two")]
+    version: u32,
+    #[serde(default)]
+    year: i32,
+    #[serde(default)]
+    records: Vec<DayRecord>,
+}
+
+impl Doc {
+    /// 索引文件的内容（不含 records）。
+    pub fn to_year_index_json(&self) -> Result<String, serde_json::Error> {
+        let mut years: Vec<i32> = self.records.iter().map(|r| r.date.year()).collect();
+        years.sort_unstable();
+        years.dedup();
+        let index = YearIndex {
+            version: self.version,
+            legacy_templates: Vec::new(),
+            templates: self.templates.clone(),
+            tags: self.tags.clone(),
+            years,
+        };
+        serde_json::to_string_pretty(&index)
+    }
+
+    /// 按年份分组后的 `(年份, 该年文件内容)` 列表。
+    pub fn to_year_files(&self) -> Result<Vec<(i32, String)>, serde_json::Error> {
+        use std::collections::BTreeMap;
+        // BTreeMap 保证年份升序输出，文件顺序稳定（便于 diff）
+        let mut by_year: BTreeMap<i32, Vec<DayRecord>> = BTreeMap::new();
+        for record in &self.records {
+            by_year.entry(record.date.year()).or_default().push(record.clone());
+        }
+        let mut out = Vec::with_capacity(by_year.len());
+        for (year, records) in by_year {
+            let file = YearRecords {
+                version: self.version,
+                year,
+                records,
+            };
+            out.push((year, serde_json::to_string_pretty(&file)?));
+        }
+        Ok(out)
+    }
+
+    /// 由索引内容 + 各年记录内容重建完整 `Doc`。
+    ///
+    /// 索引里没有 records，年份文件里没有模板，两者合并才是完整文档。
+    pub fn from_year_parts(index: &str, year_files: &[String]) -> Result<Self, serde_json::Error> {
+        let idx: YearIndex = serde_json::from_str(index)?;
+        let mut records = Vec::new();
+        for text in year_files {
+            let file: YearRecords = serde_json::from_str(text)?;
+            records.extend(file.records);
+        }
+        // 记录按日期稳定排序，让「同一天的多条」在界面上顺序固定
+        records.sort_by(|a, b| {
+            a.date
+                .cmp(&b.date)
+                .then_with(|| a.time.cmp(&b.time))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        Ok(Self {
+            version: idx.version,
+            legacy_templates: idx.legacy_templates,
+            templates: idx.templates,
+            records,
+            tags: idx.tags,
+        })
+    }
+
+    /// 单个旧格式 `plans.json` 的内容 → Doc（迁移用；格式与 v2 一致）。
+    pub fn from_legacy_plans_json(text: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str::<Self>(text)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

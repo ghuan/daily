@@ -20,7 +20,7 @@ use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIc
 use uuid::Uuid;
 
 use model::{DayRecord, Doc, Plan, RemindWindow, RepeatRule};
-use store::{GitConfig, GitStore, Kind, LocalStore, Settings};
+use store::{DocStore, GitConfig, GitStore, Kind, Settings};
 
 const APP_TITLE: &str = "小铃 · 计划与提醒";
 const APP_NAME: &str = "小铃";
@@ -600,7 +600,7 @@ fn load_tray_icon() -> tray_icon::Icon {
 /// Git（`repo/`）只作同步中转，不再是数据源 —— 见 `store::GitStore` 的说明。
 /// 因此「存储方式」这个设置只影响**要不要同步**，不影响数据放在哪里。
 struct Backend {
-    local: LocalStore,
+    local: DocStore,
     /// 配置了 Git 时附带的同步通道（不参与读写）。
     git: Option<GitStore>,
 }
@@ -617,7 +617,7 @@ impl Backend {
     fn describe(&self) -> String {
         match &self.git {
             Some(git) => format!("Git {}", store::display_url(&git.url())),
-            None => format!("本地 {}", self.local.path().display()),
+            None => format!("本地 {}", self.local.dir().display()),
         }
     }
 }
@@ -625,7 +625,7 @@ impl Backend {
 /// 根据设置构建后端。数据源恒为本地文件；Git 只作为可选的同步通道挂上去。
 fn build_backend(settings: &Settings) -> Backend {
     let dir = store::app_dir();
-    let local = LocalStore::new(dir.join(store::LOCAL_DOC_FILE));
+    let local = DocStore::new(dir.join(store::DOC_DIR_NAME));
     let git = if git_ready(settings) {
         Some(GitStore::new(dir.join("repo"), settings.git.clone()))
     } else {
@@ -633,6 +633,10 @@ fn build_backend(settings: &Settings) -> Backend {
     };
     Backend { local, git }
 }
+
+/// 「立即同步」探测到远端有本地没有的新提交时，后台线程回传的哨兵错误文本。
+/// poll_sync 认得它，把它转成确认弹窗而不是报错。
+const PULL_NEEDS_CONFIRM: &str = "\u{1}pull-needs-confirm";
 
 /// 后台同步任务的回报。
 enum SyncMsg {
@@ -1035,6 +1039,9 @@ struct PlanApp {
     syncing: bool,
     /// 同步进行中又发生的改动，等当前任务结束后补推。
     pending_push: Option<String>,
+    /// 「立即同步」探测到远端有本地没有的新提交，等待用户确认是否覆盖本地。
+    /// 置位期间主界面顶部会显示确认条（拉取会覆盖本地未推送的改动）。
+    pending_pull_confirm: bool,
     sync_tx: Sender<SyncMsg>,
     sync_rx: Receiver<SyncMsg>,
 
@@ -1062,6 +1069,26 @@ impl PlanApp {
         // 到几十秒；放在构造期会让窗口已出现但内容迟迟画不出来（用户看到的就是白窗）。
         // 启动拉取改为后台线程，结果经 SyncMsg::Finished("startup-pull") 回填。
         let backend = build_backend(&settings);
+        // 旧布局迁移：`bell-data/plans.json` 单文件 → `bell-data/plans/` 按年目录。
+        // 失败不阻断启动 —— 读旧布局也能用（DocStore::load 会返回空，这里再兜底读旧文件）。
+        match backend
+            .local
+            .migrate_legacy(&dir.join(store::LOCAL_DOC_FILE))
+        {
+            Ok(true) => eprintln!("[bell] 已把 plans.json 迁移为按年目录"),
+            Ok(false) => {}
+            Err(e) => eprintln!("[bell] 旧数据迁移失败：{e}"),
+        }
+        // 同理：settings 里 Git 的 `path` 若还写着旧的单文件名，自动升成目录名并保存。
+        // 否则中转副本里会出现「同名文件挡住同名目录」的冲突，同步报「创建目录失败」。
+        if settings.kind == Kind::Git && settings.git.path.trim() == store::LOCAL_DOC_FILE {
+            let mut s = settings.clone();
+            s.git.path = store::DOC_DIR_NAME.to_string();
+            let path = dir.join(store::SETTINGS_FILE);
+            if store::write_json(&path, &s).is_ok() {
+                eprintln!("[bell] 已把 Git 同步路径从 plans.json 升级为 plans/");
+            }
+        }
         let doc = backend.load().unwrap_or_else(|e| {
             eprintln!("[bell] 读取计划失败：{e}");
             Doc::default()
@@ -1095,17 +1122,17 @@ impl PlanApp {
 
         let startup_pull = git_ready(&settings);
         // 启动拉取（Git 模式）放后台：网络交互不该挡住首帧。
-        // 拉到远端内容后写回本地数据文件，再经 "startup-pull" 重新读盘刷新界面。
+        // 拉到远端内容后写回本地数据目录，再经 "startup-pull" 重新读盘刷新界面。
         if startup_pull {
             let tx = sync_tx.clone();
             let cfg = settings.git.clone();
-            let local_path = store::app_dir().join(store::LOCAL_DOC_FILE);
+            let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
             std::thread::spawn(move || {
                 let git = GitStore::new(store::app_dir().join("repo"), cfg);
                 let res = git
-                    .fetch_remote()
+                    .fetch_remote_dir()
                     .and_then(|maybe| match maybe {
-                        Some(bytes) => store::write_bytes(&local_path, &bytes),
+                        Some(remote) => store::replace_dir_contents(&remote, &local_dir),
                         None => Ok(()),
                     })
                     .map(|()| "已从 Git 拉取最新".to_string())
@@ -1138,6 +1165,7 @@ impl PlanApp {
             status: None,
             syncing: startup_pull,
             pending_push: None,
+            pending_pull_confirm: false,
             sync_tx,
             sync_rx,
             tray: None,
@@ -1167,7 +1195,7 @@ impl PlanApp {
 
     /// 后台推送，避免网络请求卡住界面。
     ///
-    /// 推送内容**取自本地数据文件**（`bell-data/plans.json`），写进 `repo/` 中转副本
+    /// 推送内容**取自本地数据目录**（`bell-data/plans/`），整体写进 `repo/` 中转副本
     /// 再提交推送，保证推上去的永远是本地真实数据。
     fn start_push(&mut self, message: String) {
         if self.settings.kind != Kind::Git || !git_ready(&self.settings) {
@@ -1178,51 +1206,60 @@ impl PlanApp {
             self.pending_push = Some(message);
             return;
         }
-        // 先把本地数据序列化出来（内存里最新的状态），不读磁盘，避免拿到旧的。
-        let bytes = match serde_json::to_vec_pretty(&self.doc) {
-            Ok(b) => b,
-            Err(e) => {
-                self.set_status(format!("序列化失败：{e}"), false);
-                return;
-            }
-        };
+        // 先把这一版数据落到本地（磁盘），再让后台线程把整个目录推到中转副本。
+        // 这样推送内容与本地磁盘完全一致，不依赖内存与磁盘的时序。
+        if let Err(e) = self.persist() {
+            self.set_status(format!("保存失败：{e}"), false);
+            return;
+        }
         self.syncing = true;
         let settings = self.settings.clone();
         let tx = self.sync_tx.clone();
+        let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
         std::thread::spawn(move || {
             let git = GitStore::new(store::app_dir().join("repo"), settings.git.clone());
             let res = git
-                .push_bytes(&bytes, &message)
+                .push_dir(&local_dir, &message)
                 .map(|_| "已同步到 Git".to_string())
                 .map_err(|e| e.to_string());
             let _ = tx.send(SyncMsg::Finished("push", res));
         });
     }
 
-    /// 手动拉取（设置页「立即同步」）。
+    /// 手动拉取（设置页「立即同步」）—— 两阶段：先探测，再按需确认。
     ///
-    /// 拉到远端内容后**写回本地数据文件**，再由 poll_sync 重新读盘刷新界面。
-    /// 远端没有数据文件时返回 None，不改动本地。
-    fn start_pull(&mut self) {
+    /// 为什么不直接覆盖：两台电脑同时使用时，「最后写入赢」的整份覆盖会丢掉
+    /// 另一边的改动（实测：本机勾选的「完成」被另一台电脑稍后推送的旧全量
+    /// 数据静默覆盖回去，用户看起来就是「勾选没同步上去」）。
+    ///
+    /// 阶段一（probe_remote）：只 fetch 比较，远端没有本地没有的新提交 →
+    /// 拉取是无损的，直接执行。远端有新提交且本地也可能有未推送改动 →
+    /// 置 pending_pull_confirm，由界面弹确认条，用户点了才真正覆盖。
+    fn start_pull(&mut self, force: bool) {
         if self.settings.kind != Kind::Git || !git_ready(&self.settings) || self.syncing {
             return;
         }
         self.syncing = true;
+        self.pending_pull_confirm = false;
         let settings = self.settings.clone();
         let tx = self.sync_tx.clone();
-        let local_path = store::app_dir().join(store::LOCAL_DOC_FILE);
+        let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
         std::thread::spawn(move || {
             let git = GitStore::new(store::app_dir().join("repo"), settings.git.clone());
-            let res = git
-                .fetch_remote()
-                .and_then(|maybe| match maybe {
-                    Some(bytes) => store::write_bytes(&local_path, &bytes)
-                        .map(|()| "已从 Git 拉取最新".to_string())
-                        .map_err(|e| e),
-                    // 远端还没有数据文件：不动本地，如实告知
-                    None => Ok("远端还没有数据文件".to_string()),
-                })
-                .map_err(|e| e.to_string());
+            let res = (|| -> Result<String, anyhow::Error> {
+                let remote_newer = git.probe_remote()?;
+                if remote_newer != Some(true) || force {
+                    return match git.fetch_remote_dir()? {
+                        Some(remote_dir) => {
+                            store::replace_dir_contents(&remote_dir, &local_dir)?;
+                            Ok("已从 Git 拉取最新".to_string())
+                        }
+                        None => Ok("远端还没有数据".to_string()),
+                    };
+                }
+                Err(anyhow::anyhow!(PULL_NEEDS_CONFIRM))
+            })()
+            .map_err(|e| e.to_string());
             let _ = tx.send(SyncMsg::Finished("pull", res));
         });
     }
@@ -1244,12 +1281,23 @@ impl PlanApp {
                                 }
                             }
                         }
-                        Err(e) => self.set_status(format!("同步失败：{e}"), false),
+                        Err(e) => {
+                            // 探测到远端有本地没有的新提交：这不是失败，转成确认条
+                            if e.to_string().contains(PULL_NEEDS_CONFIRM) {
+                                self.pending_pull_confirm = true;
+                                request_ui_wake();
+                                continue;
+                            }
+                            self.set_status(format!("同步失败：{e}"), false);
+                        }
                     }
                     // 任务期间攒下的改动，现在补推一次（此前只记录、从不补推，
                     // 表现是「同步中改的东西要等下一次改动才可能上去」）。
-                    if let Some(pending) = self.pending_push.take() {
-                        self.start_push(pending);
+                    // 注意：拉取需确认时不补推 —— 用户还没决定覆盖与否。
+                    if !self.pending_pull_confirm {
+                        if let Some(pending) = self.pending_push.take() {
+                            self.start_push(pending);
+                        }
                     }
                 }
                 SyncMsg::Switched(res) => {
@@ -3795,6 +3843,27 @@ fn metric_card(ui: &mut egui::Ui, width: f32, label: &str, value: &str, accent: 
 
 /// 底部状态行：存储位置 + 最近一次同步结果（几秒后自动淡出）。
 fn ui_status_line(app: &mut PlanApp, ui: &mut egui::Ui) {
+    // 「立即同步」探测到远端有本地没有的新提交 → 显示确认条，而不是悄悄覆盖。
+    // （两台电脑同时使用时，直接覆盖会丢掉另一边的改动——实测踩过这个坑。）
+    if app.pending_pull_confirm {
+        ui.horizontal_wrapped(|ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new("⚠ 远端有本机没有的新改动。拉取将覆盖本机未推送的修改（另一台电脑可能正在使用）。")
+                    .size(12.0)
+                    .color(theme::WARN),
+            );
+            if ui.add(button_mini("仍然拉取（覆盖本机）")).clicked() {
+                app.start_pull(true);
+            }
+            if ui.add(button_mini("取消")).clicked() {
+                app.pending_pull_confirm = false;
+                app.set_status("已取消拉取，本机改动保留".into(), true);
+            }
+        });
+        ui.separator();
+    }
+
     let backend = build_backend(&app.settings);
     let mut text = backend.describe();
     let mut color = theme::TEXT_WEAK;
@@ -5097,6 +5166,7 @@ mod workflow_tests {
             status: None,
             syncing: false,
             pending_push: None,
+            pending_pull_confirm: false,
             sync_tx,
             sync_rx,
             tray: None,
@@ -5461,7 +5531,7 @@ fn ui_settings(app: &mut PlanApp, ctx: &egui::Context) {
             let hint = match app.cfg_kind {
                 Kind::Local => format!(
                     "存到 {}",
-                    store::app_dir().join(store::LOCAL_DOC_FILE).display()
+                    store::app_dir().join(store::DOC_DIR_NAME).display()
                 ),
                 Kind::Git => {
                     if store::git_available() {
@@ -5595,7 +5665,10 @@ fn ui_settings(app: &mut PlanApp, ctx: &egui::Context) {
         app.apply_settings();
     }
     if do_sync {
-        app.start_pull();
+        // 第一次点「立即同步」：探测远端，远端有本地没有的新提交时不会直接覆盖，
+        // 而是置 pending_pull_confirm 由确认条接管；用户在确认条上点「仍然拉取」
+        // 会带 force=true 再次进入。
+        app.start_pull(false);
     }
     if close || !open {
         app.show_settings = false;
@@ -5635,15 +5708,15 @@ impl PlanApp {
                 self.cfg_msg = Some("正在从 Git 拉取…".into());
                 let settings = self.settings.clone();
                 let tx = self.sync_tx.clone();
-                let local_path = store::app_dir().join(store::LOCAL_DOC_FILE);
+                let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
                 std::thread::spawn(move || {
                     let git = GitStore::new(store::app_dir().join("repo"), settings.git.clone());
-                    // Ok(true) = 远端有数据并已写回本地；Ok(false) = 远端还没有数据文件
+                    // Ok(true) = 远端有数据并已写回本地；Ok(false) = 远端还没有数据
                     let res = git
-                        .fetch_remote()
+                        .fetch_remote_dir()
                         .and_then(|maybe| match maybe {
-                            Some(bytes) => {
-                                store::write_bytes(&local_path, &bytes)?;
+                            Some(remote) => {
+                                store::replace_dir_contents(&remote, &local_dir)?;
                                 Ok(true)
                             }
                             None => Ok(false),
@@ -6078,6 +6151,10 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
+
 
 
 

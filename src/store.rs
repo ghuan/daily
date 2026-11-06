@@ -197,6 +197,16 @@ pub const LEGACY_DATA_DIR_NAME: &str = "daily-reminder-data";
 pub const SETTINGS_FILE: &str = "settings.json";
 pub const LOCAL_DOC_FILE: &str = "plans.json";
 
+/// 按年存放计划数据的子目录名（位于 `bell-data/` 下）。
+pub const DOC_DIR_NAME: &str = "plans";
+/// 索引文件名（放模板、标签、年份清单，不含 records）。
+///
+/// 历史：最初叫 `plans.json`，与目录名 `plans` 撞名，GitHub 上看起来像重复文件；
+/// 改为 `data.json`。加载时两个名字都认（旧布局迁移兼容）。
+pub const DOC_INDEX_FILE: &str = "data.json";
+/// 旧版索引文件名，仍可读取（迁移前的数据集可能还在用它）。
+pub const DOC_INDEX_FILE_LEGACY: &str = "plans.json";
+
 /// 读写本地 JSON（原子写：先写临时文件再替换）。
 pub fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
     match std::fs::read_to_string(path) {
@@ -219,7 +229,7 @@ pub fn write_text(path: &Path, text: &str) -> Result<()> {
     write_bytes(path, text.as_bytes())
 }
 
-/// 原子写字节（先写临时文件再替换）。用于「把远端拉到的内容落成本地数据文件」。
+/// 原子写字节（先写临时文件再替换）。
 pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("创建目录失败：{}", dir.display()))?;
@@ -230,29 +240,190 @@ pub fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-// ============================== 本地后端 ==============================
+// ============================== 按年存储 ==============================
 
-pub struct LocalStore {
-    path: PathBuf,
+/// 计划数据的持久化：**按年份拆成多个文件**。
+///
+/// ```text
+/// bell-data/plans/
+///   plans.json    索引：version / templates / tags / years
+///   2026.json     该年的 records
+///   2027.json
+/// ```
+///
+/// 为什么拆：记录每天增长（约 600 字节/条），单文件会越写越大 —— 每次保存都要整份
+/// 序列化重写，Git 里也会变成一份不断膨胀、无法 diff 的巨型文件。按年拆分后：
+///  - 一次保存只重写「受影响的年份」+ 一个很小的索引；
+///  - 归档的旧年份通常不再变化，Git 历史里保持稳定；
+///  - 出问题时能按年份定位、单独查看。
+///
+/// 内存里仍是完整的 `Doc`，界面代码不受影响。
+pub struct DocStore {
+    dir: PathBuf,
 }
 
-impl LocalStore {
-    pub fn new(path: PathBuf) -> Self {
-        Self { path }
+impl DocStore {
+    /// `dir` 是数据子目录（`bell-data/plans`）。
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
     }
 
+    fn index_path(&self) -> PathBuf {
+        self.dir.join(DOC_INDEX_FILE)
+    }
+
+    /// 现存的索引文件路径：优先新名 `data.json`，退回旧名 `plans.json`。
+    ///
+    /// 改名是为了消除「plans 目录下有个 plans.json」的歧义；已按旧名落盘的数据集
+    /// 照常能读，下次保存时自然写为新名。
+    fn existing_index_path(&self) -> Option<PathBuf> {
+        let new = self.dir.join(DOC_INDEX_FILE);
+        if new.exists() {
+            return Some(new);
+        }
+        let legacy = self.dir.join(DOC_INDEX_FILE_LEGACY);
+        if legacy.exists() {
+            return Some(legacy);
+        }
+        None
+    }
+
+    fn year_path(&self, year: i32) -> PathBuf {
+        self.dir.join(format!("{year}.json"))
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// 读取全部年份文件并合并成完整文档。
+    ///
+    /// 兼容三种布局：
+    ///  1. 新布局：`plans/` 目录 + 索引 + 年份文件；
+    ///  2. 过渡布局：索引文件里直接带着 records（旧代码在按年改造中途写出的）；
+    ///  3. 旧布局：`bell-data/plans.json` 单文件（首次启动会自动迁移，见 `migrate_legacy`）。
     pub fn load(&self) -> Result<Doc> {
-        Ok(read_json::<Doc>(&self.path)?
-            .unwrap_or_default()
-            .normalized())
+        let Some(index) = self.existing_index_path() else {
+            return Ok(Doc::default());
+        };
+        let index_text = std::fs::read_to_string(&index)
+            .with_context(|| format!("读取失败：{}", index.display()))?;
+
+        // 过渡布局：索引本身带 records（YearIndex 没有这个字段，但旧代码写过）。
+        // 直接按完整 Doc 解析，能用就用，避免数据「看得见读不出」。
+        if index_text.contains("\"records\"") {
+            let doc: Doc = serde_json::from_str(&index_text)
+                .with_context(|| format!("解析失败：{}", index.display()))?;
+            return Ok(doc.normalized());
+        }
+
+        let mut year_texts = Vec::new();
+        // 以**目录里实际存在的 `NNNN.json` 文件**为准，而不是索引里的 years 字段：
+        // 索引字段可能因为手工编辑/同步冲突而不一致，目录内容才是事实。
+        for year in self.list_year_files() {
+            let path = self.year_path(year);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => year_texts.push(text),
+                // 扫描与读取之间文件被删：不算致命
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| format!("读取失败：{}", path.display()));
+                }
+            }
+        }
+        let doc = Doc::from_year_parts(&index_text, &year_texts)
+            .with_context(|| format!("解析失败：{}", index.display()))?;
+        Ok(doc.normalized())
     }
 
+    /// 列出目录里现存的年份文件（`2026.json` → `2026`），升序。
+    fn list_year_files(&self) -> Vec<i32> {
+        let mut years = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return years;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(stem) = name.strip_suffix(".json") {
+                if let Ok(year) = stem.parse::<i32>() {
+                    years.push(year);
+                }
+            }
+        }
+        years.sort_unstable();
+        years
+    }
+
+    /// 保存：重写索引 + 受影响的年份文件，并清掉已经不存在的年份文件。
     pub fn save(&self, doc: &Doc) -> Result<()> {
-        write_json(&self.path, doc)
+        std::fs::create_dir_all(&self.dir)
+            .with_context(|| format!("创建目录失败：{}", self.dir.display()))?;
+
+        let files = doc
+            .to_year_files()
+            .context("序列化年份文件失败")?;
+        let index_text = doc.to_year_index_json().context("序列化索引失败")?;
+        // 先写年份文件，最后写索引 —— 索引是「这套数据有哪些年份」的清单，
+        // 它若先落地而年份文件还没写完，中途崩溃会读到一个指向空年份的索引。
+        for (year, text) in &files {
+            write_text(&self.year_path(*year), text)?;
+        }
+
+        // 清掉已经没有任何记录的年份文件（例如用户删光了某年的记录），
+        // 以及改名前遗留的旧索引 plans.json
+        let keep: std::collections::HashSet<i32> = files.iter().map(|(y, _)| *y).collect();
+        if let Ok(entries) = std::fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name == DOC_INDEX_FILE {
+                    continue;
+                }
+                if name == DOC_INDEX_FILE_LEGACY {
+                    // 旧索引已被新 data.json 取代
+                    let _ = std::fs::remove_file(entry.path());
+                    continue;
+                }
+                if let Some(stem) = name.strip_suffix(".json") {
+                    if let Ok(year) = stem.parse::<i32>() {
+                        if !keep.contains(&year) {
+                            let _ = std::fs::remove_file(entry.path());
+                        }
+                    }
+                }
+            }
+        }
+
+        write_text(&self.index_path(), &index_text)
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// 旧布局迁移：`bell-data/plans.json`（单文件）→ `plans/` 目录。
+    ///
+    /// 迁移后旧文件改名为 `plans.json.migrated`（保留一份，方便回退），
+    /// 并清空 Git 中转副本，让它用新布局重新提交。
+    ///
+    /// 返回 `true` 表示确实做了迁移。
+    pub fn migrate_legacy(&self, legacy_path: &Path) -> Result<bool> {
+        if !legacy_path.exists() {
+            return Ok(false);
+        }
+        // 新布局已经存在就不迁移，避免覆盖（正常情况下不会两者并存）
+        if self.existing_index_path().is_some() {
+            return Ok(false);
+        }
+        let text = std::fs::read_to_string(legacy_path)
+            .with_context(|| format!("读取旧数据失败：{}", legacy_path.display()))?;
+        if text.trim().is_empty() {
+            return Ok(false);
+        }
+        let doc = Doc::from_legacy_plans_json(&text)
+            .with_context(|| format!("解析旧数据失败：{}", legacy_path.display()))?
+            .normalized();
+        self.save(&doc)?;
+        let backup = legacy_path.with_extension("json.migrated");
+        let _ = std::fs::rename(legacy_path, &backup);
+        Ok(true)
     }
 }
 
@@ -291,6 +462,13 @@ impl GitStore {
     pub fn prepare(&self) -> Result<()> {
         if !self.cfg.is_complete() {
             bail!("Git 配置不完整：请填写仓库地址");
+        }
+        // 旧版配置遗留：`path` 是单文件（plans.json），而新版把它当**目录**用。
+        // 若中转副本里那个位置是一个文件，创建同名目录必然失败 —— 直接清掉整个副本
+        // 重新 clone（副本里没有用户数据，见 struct 注释）。
+        let cfg_path = self.dir.join(self.cfg.path.trim());
+        if cfg_path.is_file() {
+            let _ = std::fs::remove_dir_all(&self.dir);
         }
         if self.dir.join(".git").is_dir() {
             // 已有工作副本：校正 remote 与分支。
@@ -336,7 +514,59 @@ impl GitStore {
     ///
     /// 返回 `None` = 远端还没有这个数据文件（全新仓库 / 首次使用）。
     /// **不改动本地数据**：写入 `bell-data/plans.json` 由调用方决定。
-    pub fn fetch_remote(&self) -> Result<Option<Vec<u8>>> {
+    /// 远端数据在**中转副本**里的目录（远端仓库根下的一级目录）。
+    ///
+    /// 旧版是单个文件（`path` 形如 `plans.json`），新版是目录（`plans/`）。
+    /// 这里根据配置里的 `path` 判断：没有 `.json` 后缀就当目录处理。
+    fn remote_dir(&self) -> PathBuf {
+        self.dir.join(self.cfg.path.trim())
+    }
+
+
+    /// 只探测远端：`fetch` 并比较远端分支与本地 HEAD 的时间与领先关系。
+    ///
+    /// 返回：
+    ///  - `None`：远端还没有数据分支
+    ///  - Some(false)：远端与本地一致（或远端更旧），拉取是安全的
+    ///  - Some(true)：远端有本地没有的新提交（拉取会改动本地）
+    ///
+    /// 注意：这只做 `fetch`（写中转副本的 `.git`），**不**改工作区、不动本地数据。
+    pub fn probe_remote(&self) -> Result<Option<bool>> {
+        self.prepare()?;
+        let branch = self.cfg.branch.trim();
+        if self
+            .run(&["rev-parse", "--verify", &format!("origin/{branch}")])
+            .is_err()
+        {
+            return Ok(None);
+        }
+        self.run(&["fetch", "origin", branch])?;
+        let remote = format!("origin/{branch}");
+        // 本地 HEAD 不存在（首次）→ 远端任何东西都算「新」
+        if self
+            .run(&["rev-parse", "--verify", branch])
+            .is_err()
+        {
+            return Ok(Some(true));
+        }
+        // 双向计数：左 = 本地领先（本地有未推送提交），右 = 远端领先
+        let out = self.run(&[
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{branch}...{remote}"),
+        ])?;
+        let mut parts = out.split_whitespace();
+        let local_ahead = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        let remote_ahead = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        Ok(Some(remote_ahead > 0))
+    }
+
+    /// 从远端拉取数据到中转副本，并返回远端数据在副本里的**目录**。
+    ///
+    /// 返回 `None` = 远端还没有数据（目录不存在且旧单文件也不存在）。
+    /// **不改动本地数据**：由调用方决定怎么落到本地。
+    pub fn fetch_remote_dir(&self) -> Result<Option<PathBuf>> {
         self.prepare()?;
         let branch = self.cfg.branch.trim();
         // 允许远端为空（首次提交前没有该分支）
@@ -354,36 +584,53 @@ impl GitStore {
         } else {
             self.run(&["reset", "--hard", &format!("origin/{branch}")])?;
         }
-        let path = self.data_path();
-        match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).with_context(|| format!("读取远端数据失败：{}", path.display())),
+        let dir = self.remote_dir();
+        if dir.is_dir() {
+            return Ok(Some(dir));
         }
+        // 兼容旧版单文件布局：把 plans.json 转录成一个「临时目录」供调用方统一处理
+        let legacy = self.data_path();
+        if legacy.is_file() {
+            let tmp = self.dir.join(".dsh-legacy-single");
+            let _ = std::fs::remove_dir_all(&tmp);
+            std::fs::create_dir_all(&tmp)?;
+            std::fs::copy(&legacy, tmp.join(DOC_INDEX_FILE))?;
+            return Ok(Some(tmp));
+        }
+        Ok(None)
     }
 
-    /// 把给定的数据文件内容推送到远端。
+    /// 把本地 `plans/` 目录的内容整体推送到远端。
     ///
-    /// 调用方传入**本地数据文件的字节**（`bell-data/plans.json`），由这里写进中转副本
-    /// 再提交推送。这样推送的内容永远等于本地真实数据，不受中转副本残留影响。
-    pub fn push_bytes(&self, bytes: &[u8], message: &str) -> Result<()> {
+    /// 做法：清掉中转副本里的数据目录 → 拷入本地目录 → add/commit/push。
+    /// 这样远端内容永远等于本地真实数据，不受副本残留影响，也能正确处理
+    /// 「某个年份文件被删除」这种情况（否则 git 会保留旧文件）。
+    pub fn push_dir(&self, local_dir: &Path, message: &str) -> Result<()> {
         self.prepare()?;
         let branch = self.cfg.branch.trim().to_string();
-        let rel = self.cfg.path.trim().to_string();
-        let path = self.data_path();
+        let dest = self.remote_dir();
 
-        // 先把本地数据写进中转副本（覆盖副本里可能存在的旧内容）
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建目录失败：{}", parent.display()))?;
+        if local_dir.is_dir() {
+            // 先删干净再拷：保证远端不会残留本地已删除的年份文件
+            let _ = std::fs::remove_dir_all(&dest);
+            std::fs::create_dir_all(&dest)
+                .with_context(|| format!("创建目录失败：{}", dest.display()))?;
+            copy_dir_contents(local_dir, &dest)?;
+        } else {
+            return Err(anyhow!("本地数据目录不存在：{}", local_dir.display()));
         }
-        std::fs::write(&path, bytes)
-            .with_context(|| format!("写入中转副本失败：{}", path.display()))?;
+        // 旧版单文件（repo 根的 plans.json）与改名前的索引（plans/plans.json）
+        // 若还留在副本里，一并删掉，避免多种布局并存
+        let _ = std::fs::remove_file(self.dir.join(DOC_INDEX_FILE_LEGACY));
+        let _ = std::fs::remove_file(dest.join(DOC_INDEX_FILE_LEGACY));
 
-        self.run(&["add", "--", &rel])?;
-        // 没有改动就不用提交
+        // `-A` 不带路径限制：把副本里的**所有**变化（含旧单文件的删除）都暂存。
+        // 若只 `add -A -- <目录>`，根目录下旧 plans.json 的删除不会被暂存，
+        // 远端就会残留一个过期的单文件布局。
+        self.run(&["add", "-A"])?;
+        // 没有改动就不用提交（status 不带路径限制：整个副本有任何变化都要提交）
         if self
-            .run(&["status", "--porcelain", "--", &rel])
+            .run(&["status", "--porcelain"])
             .map(|s| s.trim().is_empty())
             .unwrap_or(false)
         {
@@ -478,6 +725,56 @@ fn redact(text: &str, cfg: &GitConfig) -> String {
     s
 }
 
+/// 用 `from` 目录的内容**整体替换** `to` 目录的内容。
+///
+/// 顺序刻意是「先全部拷入，再删多余」而不是「先清空再拷」：
+/// 万一中途失败（磁盘满、权限不足），本地至少还留着旧数据，不会变成空目录
+/// 导致「打开程序计划全没了」。
+pub fn replace_dir_contents(from: &Path, to: &Path) -> Result<()> {
+    std::fs::create_dir_all(to)
+        .with_context(|| format!("创建目录失败：{}", to.display()))?;
+    copy_dir_contents(from, to)?;
+
+    // 远端没有、本地残留的文件（例如某年份已被删除）在这里清掉
+    let keep: std::collections::HashSet<std::ffi::OsString> = std::fs::read_dir(from)
+        .map(|it| it.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    if let Ok(entries) = std::fs::read_dir(to) {
+        for entry in entries.flatten() {
+            if !keep.contains(&entry.file_name()) {
+                let path = entry.path();
+                if path.is_dir() {
+                    let _ = std::fs::remove_dir_all(&path);
+                } else {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 递归复制目录内容（只处理普通文件与一层层子目录；数据目录里没有符号链接）。
+fn copy_dir_contents(from: &Path, to: &Path) -> Result<()> {    std::fs::create_dir_all(to)
+        .with_context(|| format!("创建目录失败：{}", to.display()))?;
+    for entry in std::fs::read_dir(from)
+        .with_context(|| format!("读取目录失败：{}", from.display()))?
+    {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_contents(&src, &dst)?;
+        } else if ty.is_file() {
+            std::fs::copy(&src, &dst)
+                .with_context(|| format!("复制失败：{} → {}", src.display(), dst.display()))?;
+        }
+        // 符号链接等一律跳过：数据目录里不应出现，跟随它反而可能复制到别处
+    }
+    Ok(())
+}
+
 /// 过滤远端地址里的凭据（用于界面/日志展示）。
 pub fn display_url(url: &str) -> String {
     match (url.find("://"), url.find('@')) {
@@ -514,10 +811,9 @@ mod tests {
     #[test]
     fn local_roundtrip() {
         let dir = std::env::temp_dir().join(format!("dr-test-{}", uuid::Uuid::new_v4()));
-        let path = dir.join("plans.json");
-        let store = LocalStore::new(path.clone());
+        let store = DocStore::new(dir.join(DOC_DIR_NAME));
 
-        // 没有文件时返回空文档
+        // 没有目录时返回空文档
         assert!(store.load().unwrap().templates.is_empty());
 
         let mut doc = Doc::default();
@@ -531,6 +827,107 @@ mod tests {
         let back = store.load().unwrap();
         assert_eq!(back.templates.len(), 1);
         assert_eq!(back.templates[0].title, "喝水");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 记录按年份落到不同文件，索引里只有模板/标签/年份清单。
+    #[test]
+    fn records_are_split_by_year() {
+        use crate::model::DayRecord;
+        let dir = std::env::temp_dir().join(format!("dr-year-{}", uuid::Uuid::new_v4()));
+        let store = DocStore::new(dir.join(DOC_DIR_NAME));
+
+        let template = Plan::new("喝水".into(), String::new(), NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        let mut doc = Doc::default();
+        doc.templates.push(template.clone());
+        for (y, m, d) in [(2026, 11, 2), (2026, 12, 31), (2027, 1, 1), (2027, 6, 15)] {
+            let date = chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap();
+            doc.records.push(DayRecord::from_template(&template, date));
+        }
+        store.save(&doc).unwrap();
+
+        // 目录里应有索引 + 两个年份文件
+        let mut names: Vec<String> = std::fs::read_dir(dir.join(DOC_DIR_NAME))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["2026.json", "2027.json", "data.json"]);
+
+        // 索引里不含 records
+        let index = std::fs::read_to_string(dir.join(DOC_DIR_NAME).join(DOC_INDEX_FILE)).unwrap();
+        assert!(!index.contains("\"records\""));
+        assert!(index.contains("templates"));
+
+        // 年份文件里只有当年的记录
+        let y2026 = std::fs::read_to_string(dir.join(DOC_DIR_NAME).join("2026.json")).unwrap();
+        assert!(y2026.contains("2026-11-02"));
+        assert!(y2026.contains("2026-12-31"));
+        assert!(!y2026.contains("2027-01-01"));
+
+        // 合并回来与原文档一致
+        let back = store.load().unwrap();
+        assert_eq!(back.records.len(), 4);
+        assert_eq!(back.templates.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 某年记录被删光后，该年份文件也应从磁盘上消失（避免留下空文件）。
+    #[test]
+    fn empty_year_file_is_removed() {
+        use crate::model::DayRecord;
+        let dir = std::env::temp_dir().join(format!("dr-prune-{}", uuid::Uuid::new_v4()));
+        let store = DocStore::new(dir.join(DOC_DIR_NAME));
+
+        let template = Plan::new("A".into(), String::new(), NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        let mut doc = Doc::default();
+        doc.records.push(DayRecord::from_template(
+            &template,
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 1).unwrap(),
+        ));
+        store.save(&doc).unwrap();
+        assert!(dir.join(DOC_DIR_NAME).join("2026.json").exists());
+
+        // 清空记录后再存：2026.json 应被清掉
+        doc.records.clear();
+        store.save(&doc).unwrap();
+        assert!(!dir.join(DOC_DIR_NAME).join("2026.json").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 旧布局（单文件 plans.json）能自动迁移成按年目录，并保留一份 .migrated 备份。
+    #[test]
+    fn legacy_single_file_migrates() {
+        use crate::model::DayRecord;
+        let dir = std::env::temp_dir().join(format!("dr-mig-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join(LOCAL_DOC_FILE);
+
+        let template = Plan::new("旧数据".into(), String::new(), NaiveTime::from_hms_opt(9, 0, 0).unwrap());
+        let mut doc = Doc::default();
+        doc.templates.push(template.clone());
+        doc.records.push(DayRecord::from_template(
+            &template,
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 8).unwrap(),
+        ));
+        write_json(&legacy, &doc).unwrap();
+
+        let store = DocStore::new(dir.join(DOC_DIR_NAME));
+        assert!(store.migrate_legacy(&legacy).unwrap());
+
+        // 旧文件已改名成 .migrated，新目录里是拆分后的文件
+        assert!(!legacy.exists());
+        assert!(dir.join("plans.json.migrated").exists());
+        let back = store.load().unwrap();
+        assert_eq!(back.templates.len(), 1);
+        assert_eq!(back.records.len(), 1);
+
+        // 再迁移一次应无事发生（幂等）
+        assert!(!store.migrate_legacy(&dir.join("plans.json.migrated")).unwrap());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -690,25 +1087,30 @@ mod tests {
         let cfg = GitConfig {
             url: remote.to_string_lossy().into_owned(),
             branch: "main".into(),
-            path: "plans.json".into(),
+            // 新版：同步的是**目录**（不带 .json 后缀）
+            path: DOC_DIR_NAME.into(),
             ..Default::default()
         };
         let a = GitStore::new(a_dir, cfg.clone());
         a.prepare().unwrap();
+
+        // 本地数据目录（用 DocStore 生成按年文件）
+        let a_doc = DocStore::new(base.join("a-plans"));
         let mut doc = Doc::default();
         doc.templates.push(Plan::new(
             "跑步".into(),
             String::new(),
             NaiveTime::from_hms_opt(7, 30, 0).unwrap(),
         ));
-        // 新模型：推送内容由调用方给出（本地数据文件的字节），不经中转副本读取
-        let bytes = serde_json::to_vec_pretty(&doc).unwrap();
-        a.push_bytes(&bytes, "add running").unwrap();
+        a_doc.save(&doc).unwrap();
+        a.push_dir(a_doc.dir(), "add running").unwrap();
 
         // 第二个客户端拉取
         let b = GitStore::new(base.join("b"), cfg);
-        let got_bytes = b.fetch_remote().unwrap().expect("远端应已有数据文件");
-        let got: Doc = serde_json::from_slice(&got_bytes).unwrap();
+        let remote_dir = b.fetch_remote_dir().unwrap().expect("远端应已有数据目录");
+        let b_doc = DocStore::new(base.join("b-plans"));
+        replace_dir_contents(&remote_dir, b_doc.dir()).unwrap();
+        let got = b_doc.load().unwrap();
         assert_eq!(got.templates.len(), 1);
         assert_eq!(got.templates[0].title, "跑步");
 
@@ -732,27 +1134,30 @@ mod tests {
         let cfg = GitConfig {
             url: remote.to_string_lossy().into_owned(),
             branch: "main".into(),
-            path: "plans.json".into(),
+            path: DOC_DIR_NAME.into(),
             ..Default::default()
         };
 
+        let local = DocStore::new(base.join("a-plans"));
         let mut doc = Doc::default();
         doc.templates.push(Plan::new(
             "喝水".into(),
             String::new(),
             NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
         ));
-        let bytes = serde_json::to_vec_pretty(&doc).unwrap();
+        local.save(&doc).unwrap();
 
         let a = GitStore::new(base.join("a"), cfg.clone());
-        a.push_bytes(&bytes, "add water").unwrap();
+        a.push_dir(local.dir(), "add water").unwrap();
 
         // 把整个中转副本删掉，模拟「用户手动清了 repo 目录 / 副本损坏」
         std::fs::remove_dir_all(base.join("a")).unwrap();
 
         // 同一个 GitStore 重新准备并拉取：应能重新 clone 并拿到同一份数据
-        let again = a.fetch_remote().unwrap().expect("重建后应能拉到数据");
-        let got: Doc = serde_json::from_slice(&again).unwrap();
+        let remote_dir = a.fetch_remote_dir().unwrap().expect("重建后应能拉到数据");
+        let restored = DocStore::new(base.join("restored"));
+        replace_dir_contents(&remote_dir, restored.dir()).unwrap();
+        let got = restored.load().unwrap();
         assert_eq!(got.templates.len(), 1);
         assert_eq!(got.templates[0].title, "喝水");
 
@@ -772,15 +1177,20 @@ mod tests {
         let cfg = GitConfig {
             url: remote.to_string_lossy().into_owned(),
             branch: "main".into(),
-            path: "plans.json".into(),
+            path: DOC_DIR_NAME.into(),
             ..Default::default()
         };
+        let local = DocStore::new(base.join("w-plans"));
+        local.save(&Doc::default()).unwrap();
+
         let store = GitStore::new(base.join("w"), cfg);
         store.prepare().unwrap();
-        let bytes = serde_json::to_vec_pretty(&Doc::default()).unwrap();
-        store.push_bytes(&bytes, "first").unwrap();
+        store.push_dir(local.dir(), "first").unwrap();
         // 第二次内容相同：不应报错，也不产生提交
-        store.push_bytes(&bytes, "second").unwrap();
+        store.push_dir(local.dir(), "second").unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 }
+
+
+

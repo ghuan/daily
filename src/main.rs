@@ -1898,6 +1898,7 @@ impl eframe::App for PlanApp {
         ui_delete_template_dialog(self, ctx);
         ui_record_delete_dialog(self, ctx);
         ui_settings(self, ctx);
+        ui_pull_confirm_dialog(self, ctx);
         ui_popups(self, ctx);
 
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -3842,26 +3843,6 @@ fn metric_card(ui: &mut egui::Ui, width: f32, label: &str, value: &str, accent: 
 /// 底部状态行：存储位置 + 最近一次同步结果（几秒后自动淡出）。
 fn ui_status_line(app: &mut PlanApp, ui: &mut egui::Ui) {
     // 「立即同步」探测到远端有本地没有的新提交 → 显示确认条，而不是悄悄覆盖。
-    // （两台电脑同时使用时，直接覆盖会丢掉另一边的改动——实测踩过这个坑。）
-    if app.pending_pull_confirm {
-        ui.horizontal_wrapped(|ui| {
-            ui.set_min_width(ui.available_width());
-            ui.label(
-                RichText::new("⚠ 远端有本机没有的新改动。拉取将覆盖本机未推送的修改（另一台电脑可能正在使用）。")
-                    .size(12.0)
-                    .color(theme::WARN),
-            );
-            if ui.add(button_mini("仍然拉取（覆盖本机）")).clicked() {
-                app.start_pull(true);
-            }
-            if ui.add(button_mini("取消")).clicked() {
-                app.pending_pull_confirm = false;
-                app.set_status("已取消拉取，本机改动保留".into(), true);
-            }
-        });
-        ui.separator();
-    }
-
     let backend = build_backend(&app.settings);
     let mut text = backend.describe();
     let mut color = theme::TEXT_WEAK;
@@ -5475,6 +5456,55 @@ mod workflow_tests {
     }
 }
 // ============================== 设置对话框 ==============================
+
+/// 「立即同步」探测到**真分叉**时的确认弹窗。
+///
+/// 必须是独立窗口：早期版本画在主界面状态行里，会被设置弹窗整个盖住 ——
+/// 用户点「立即同步」后什么都没看到，还以为同步失效了。
+fn ui_pull_confirm_dialog(app: &mut PlanApp, ctx: &egui::Context) {
+    if !app.pending_pull_confirm {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("⚠ 同步确认")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .title_bar(false)
+        .frame(
+            egui::Frame::window(&ctx.global_style())
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .corner_radius(egui::CornerRadius::same(14))
+                .inner_margin(egui::Margin::same(18)),
+        )
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.set_min_width(420.0);
+            ui.label(RichText::new("同步确认").size(18.0).strong().color(theme::TEXT));
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(
+                    "本机与远端都有对方没有的改动。拉取远端数据会覆盖本机尚未推送的修改\n（另一台电脑可能正在使用）。",
+                )
+                .size(13.0)
+                .color(theme::TEXT_WEAK),
+            );
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                if ui.add(button_primary("仍然拉取（覆盖本机）")).clicked() {
+                    app.start_pull(true);
+                }
+                if ui.add(button_ghost("取消")).clicked() {
+                    app.pending_pull_confirm = false;
+                    app.set_status("已取消拉取，本机改动保留".into(), true);
+                }
+            });
+        });
+    if !open {
+        app.pending_pull_confirm = false;
+    }
+}
 
 fn ui_settings(app: &mut PlanApp, ctx: &egui::Context) {
     if !app.show_settings {

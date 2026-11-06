@@ -527,8 +527,12 @@ impl GitStore {
     ///
     /// 返回：
     ///  - `None`：远端还没有数据分支
-    ///  - Some(false)：远端与本地一致（或远端更旧），拉取是安全的
-    ///  - Some(true)：远端有本地没有的新提交（拉取会改动本地）
+    ///  - Some(false)：可以直接拉取（纯落后、一致、或本机纯领先，都不会丢改动）
+    ///  - Some(true)：**真分叉**——本机与远端各有对方没有的提交，拉取会覆盖本机
+    ///
+    /// 「纯落后」（local_ahead=0, remote_ahead>0）是最常见的多机场景：另一台
+    /// 推了新数据，本机什么都没动。此时拉取完全无损，必须直接拉，否则用户点
+    /// 「立即同步」会卡在确认条上（而确认条若被弹窗挡住就永远同步不到）。
     ///
     /// 注意：这只做 `fetch`（写中转副本的 `.git`），**不**改工作区、不动本地数据。
     pub fn probe_remote(&self) -> Result<Option<bool>> {
@@ -542,14 +546,11 @@ impl GitStore {
         }
         self.run(&["fetch", "origin", branch])?;
         let remote = format!("origin/{branch}");
-        // 本地 HEAD 不存在（首次）→ 远端任何东西都算「新」
-        if self
-            .run(&["rev-parse", "--verify", branch])
-            .is_err()
-        {
-            return Ok(Some(true));
+        // 本地 HEAD 不存在（首次）→ 远端任何东西都算「新」，但同样没有本地改动要保护
+        if self.run(&["rev-parse", "--verify", branch]).is_err() {
+            return Ok(Some(false));
         }
-        // 双向计数：左 = 本地领先（本地有未推送提交），右 = 远端领先
+        // 双向计数：左 = 本地领先，右 = 远端领先
         let out = self.run(&[
             "rev-list",
             "--left-right",
@@ -559,7 +560,8 @@ impl GitStore {
         let mut parts = out.split_whitespace();
         let local_ahead = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         let remote_ahead = parts.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-        Ok(Some(remote_ahead > 0))
+        // 只有「两边都领先」才是会丢改动的真冲突
+        Ok(Some(local_ahead > 0 && remote_ahead > 0))
     }
 
     /// 从远端拉取数据到中转副本，并返回远端数据在副本里的**目录**。

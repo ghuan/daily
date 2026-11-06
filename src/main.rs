@@ -1885,8 +1885,6 @@ impl eframe::App for PlanApp {
             ctx.request_repaint();
         }
 
-
-
         self.tick(ctx);
 
         ui_sidebar(self, ui);
@@ -6151,37 +6149,5 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 

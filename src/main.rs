@@ -2904,19 +2904,21 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                         open_settings(app);
                     }
                     ui.add_space(4.0);
-                    // 手动同步：立即执行一轮「先 pull 再 push」，并清掉延迟队列
-                    // （用户主动同步说明现在就要最新状态，排队中的消息并入这次）。
-                    if ui
-                        .add_enabled(
-                            !app.syncing,
-                            button_ghost(if app.syncing { "同步中…" } else { "立即同步" }),
-                        )
-                        .clicked()
-                    {
-                        app.push_queue = None;
-                        app.manual_sync();
+                    // 手动同步：立即执行一轮「pull + push」，并清掉延迟队列。
+                    // 仅 Git 模式显示 —— 本地模式没有远端，「立即同步」无意义。
+                    if app.settings.kind == Kind::Git {
+                        if ui
+                            .add_enabled(
+                                !app.syncing,
+                                button_ghost(if app.syncing { "同步中…" } else { "立即同步" }),
+                            )
+                            .clicked()
+                        {
+                            app.push_queue = None;
+                            app.manual_sync();
+                        }
+                        ui.add_space(4.0);
                     }
-                    ui.add_space(4.0);
                     // 「今日记录」：始终针对今天，不跟随上面选中的日期。
                     if ui.add(button_primary("＋  今日记录")).clicked() {
                         app.open_edit_state(EditState::new_record(Local::now().date_naive()));

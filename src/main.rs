@@ -1227,14 +1227,14 @@ impl PlanApp {
             doc,
             page: WorkspacePage::Calendar,
             selected_date: Local::now().date_naive(),
-            date_view: DateView::Day,
+            date_view: DateView::Calendar,
             view_record: None,
             edit: None,
             delete_prompt: None,
             record_delete_prompt: None,
             day_popup: None,
-            ym_picker_open: false,
-            ym_picker_mode: None,
+            ym_picker_open: true,
+            ym_picker_mode: Some("year".into()),
             day_popup_rect: None,
             show_settings: false,
             cfg_error: None,
@@ -2489,41 +2489,42 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
 
     if open {
         let mode = app.ym_picker_mode.clone().unwrap_or_else(|| "month".into());
-        // 全屏透明拦截层：铺在 Foreground 层，面板用 Tooltip 层盖在它上面。
-        // 点面板外任何位置 → 命中拦截层 → 收起；点面板内 → 面板控件接管。
-        // 注意：Area 默认 max_size 是 (600,400)，必须显式放开到全屏，
-        // 否则拦截层只有 600x400，点它之外依旧收不到（实测踩过）。
-        let screen = ui.ctx().viewport_rect();
-        let intercept = egui::Area::new(egui::Id::new("ym_picker_intercept"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(screen.min)
-            .default_size(screen.size())
-            .interactable(true)
-            .show(ui.ctx(), |ui| {
-                let (r, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
-                r
-            });
-        let closed_by_intercept = intercept.response.clicked();
-
-        let id = egui::Id::new("ym_picker_popup");
-        if mode == "year" {
-            show_ym_panel(ui, id.with("y"), year_btn.rect, |ui| {
-                ym_year_grid(app, ui, selected);
-            });
+        // 面板矩形（面板 + 触发按钮都算面板的一部分）
+        let panel_rect = if mode == "year" {
+            year_btn.rect
         } else {
-            show_ym_panel(ui, id.with("m"), month_btn.rect, |ui| {
-                ym_month_grid(app, ui, selected);
-            });
-        }
-        // 面板浮层在拦截层之后创建，自然盖在拦截层上面：面板内的点击落在
-        // 面板控件上，不会触发拦截层的 clicked；点到面板外任何位置都命中
-        // 拦截层 → 收起。
+            month_btn.rect
+        };
 
-        if closed_by_intercept {
+        // ★「点外面关闭」的输入级实现：本帧发生主键点击（press+release），
+        // 且指针位置不在面板 rect 内 → 收起。用的是全局输入（primary_clicked
+        // + interact_pos），完全不依赖 egui 的 hit-test —— 此前的 Area 拦截层
+        // 方案被其它持久化浮层的死 widget 抢走点击（实测），输入级判定没有这个坑。
+        // 注意：打开动作本身的点击在面板 rect 内（点的是年/月按钮），天然不会误关。
+        let released_outside = ui.input(|i| {
+            if !i.pointer.primary_clicked() {
+                return false;
+            }
+            let Some(pos) = i.pointer.interact_pos() else {
+                return false;
+            };
+            !panel_rect.contains(pos)
+        });
+        if released_outside {
             app.ym_picker_open = false;
         }
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             app.ym_picker_open = false;
+        }
+        // 面板本体
+        if mode == "year" {
+            show_ym_panel(ui, egui::Id::new("ym_picker_popup").with("y"), panel_rect, |ui| {
+                ym_year_grid(app, ui, selected);
+            });
+        } else {
+            show_ym_panel(ui, egui::Id::new("ym_picker_popup").with("m"), panel_rect, |ui| {
+                ym_month_grid(app, ui, selected);
+            });
         }
     }
     // ★ 把本地状态写回：点按钮 → open=true 必须存进 app，下一帧才知道面板开着。
@@ -5682,14 +5683,14 @@ mod workflow_tests {
             doc: Doc::default(),
             page: WorkspacePage::Calendar,
             selected_date: date(2026, 11, 2),
-            date_view: DateView::Day,
+            date_view: DateView::Calendar,
             view_record: None,
             edit: None,
             delete_prompt: None,
             record_delete_prompt: None,
             day_popup: None,
-            ym_picker_open: false,
-            ym_picker_mode: None,
+            ym_picker_open: true,
+            ym_picker_mode: Some("year".into()),
             day_popup_rect: None,
             show_settings: false,
             cfg_kind: Kind::Local,
@@ -6952,6 +6953,9 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
 
 
 

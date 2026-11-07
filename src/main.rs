@@ -1105,6 +1105,9 @@ struct PlanApp {
     conflict_scan_running: bool,
     /// 冲突副本管理弹窗是否打开。
     show_conflicts: bool,
+    /// 弹窗刚被打开的帧标记：这一帧的点击是「打开动作本身」，
+    /// 外点检测必须跳过，否则弹窗会被同一次点击立即关闭。
+    dialog_just_opened: bool,
     /// 当前在弹窗里选中的副本分支（None = 只显示列表）。
     conflict_view: Option<String>,
     /// 选中的副本解析出来的数据（与主数据的对比就基于它）。
@@ -1240,6 +1243,7 @@ impl PlanApp {
             conflict_branches: None,
             conflict_scan_running: false,
             show_conflicts: false,
+            dialog_just_opened: false,
             conflict_view: None,
             conflict_doc: None,
             conflict_error: None,
@@ -1814,6 +1818,9 @@ impl PlanApp {
 
     /// 关掉除指定项以外的所有弹窗。
     fn close_all_dialogs_except(&mut self, keep: DialogKeep) {
+        // 任何弹窗打开都会先经过这里：标记「弹窗刚打开」，让外点检测
+        // 跳过本帧的点击（那次点击是打开动作本身，不是点外面）。
+        self.dialog_just_opened = true;
         if keep != DialogKeep::Edit {
             self.edit = None;
         }
@@ -2138,6 +2145,10 @@ impl eframe::App for PlanApp {
         ui_conflicts_dialog(self, ctx);
         ui_popups(self, ctx);
 
+        // 「弹窗刚打开」只豁免一帧：本帧所有对话框都处理完了，下一帧起
+        // 外点检测正常生效。
+        self.dialog_just_opened = false;
+
         ctx.request_repaint_after(Duration::from_secs(1));
     }
 }
@@ -2150,7 +2161,17 @@ impl eframe::App for PlanApp {
 /// 时间选择器等独立 Area）的矩形。点在浮层上不应关闭弹窗。
 ///
 /// egui 的 Window 不自带外点关闭，各对话框在 show 之后统一调用本函数。
-fn clicked_outside_window(ctx: &egui::Context, window_rect: egui::Rect, extra_rects: &[egui::Rect]) -> bool {
+/// 弹窗刚打开的那一帧（`dialog_just_opened`）恒返回 false——那一次点击
+/// 是「打开动作」本身，位置必然还在旧界面（弹窗矩形）之外。
+fn clicked_outside_window(
+    ctx: &egui::Context,
+    window_rect: egui::Rect,
+    extra_rects: &[egui::Rect],
+    just_opened: bool,
+) -> bool {
+    if just_opened {
+        return false;
+    }
     ctx.input(|i| {
         if !i.pointer.any_click() {
             return false;
@@ -4470,7 +4491,7 @@ fn ui_record_view_dialog(app: &mut PlanApp, ctx: &egui::Context) {
         });
     let outside = window
         .as_ref()
-        .map(|w| clicked_outside_window(ctx, w.response.rect, &[]))
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &[], app.dialog_just_opened))
         .unwrap_or(false);
     if edit {
         app.view_record = None;
@@ -4591,7 +4612,7 @@ fn ui_delete_template_dialog(app: &mut PlanApp, ctx: &egui::Context) {
 
     let outside = window
         .as_ref()
-        .map(|w| clicked_outside_window(ctx, w.response.rect, &[]))
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &[], app.dialog_just_opened))
         .unwrap_or(false);
     if confirm {
         let (id, remove) = (prompt.template_id, prompt.remove_records);
@@ -4702,7 +4723,7 @@ fn ui_record_delete_dialog(app: &mut PlanApp, ctx: &egui::Context) {
 
     let outside = window
         .as_ref()
-        .map(|w| clicked_outside_window(ctx, w.response.rect, &[]))
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &[], app.dialog_just_opened))
         .unwrap_or(false);
     if confirm {
         app.record_delete_prompt = None;
@@ -5417,7 +5438,7 @@ fn ui_edit_dialog(app: &mut PlanApp, ctx: &egui::Context) {
     }
     let outside = window
         .as_ref()
-        .map(|w| clicked_outside_window(ctx, w.response.rect, &extra))
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &extra, app.dialog_just_opened))
         .unwrap_or(false);
     // 有浮层展开时先收浮层，不关弹窗（符合直觉：第一次点外面收浮层，第二次关弹窗）
     let picker_open = app
@@ -5664,6 +5685,7 @@ mod workflow_tests {
             conflict_branches: None,
             conflict_scan_running: false,
             show_conflicts: false,
+            dialog_just_opened: false,
             conflict_view: None,
             conflict_doc: None,
             conflict_error: None,
@@ -6095,7 +6117,7 @@ fn ui_conflicts_dialog(app: &mut PlanApp, ctx: &egui::Context) {
         });
     let outside = window
         .as_ref()
-        .map(|w| clicked_outside_window(ctx, w.response.rect, &[]))
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &[], app.dialog_just_opened))
         .unwrap_or(false);
     if !open || outside {
         app.show_conflicts = false;
@@ -6433,7 +6455,7 @@ fn ui_settings(app: &mut PlanApp, ctx: &egui::Context) {
 
     let outside = window
         .as_ref()
-        .map(|w| clicked_outside_window(ctx, w.response.rect, &[]))
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &[], app.dialog_just_opened))
         .unwrap_or(false);
     if apply {
         app.apply_settings();
@@ -6911,6 +6933,9 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
 
 
 

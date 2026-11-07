@@ -3197,52 +3197,51 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                         .color(Color32::from_rgb(92, 105, 133)),
                 );
                 ui.add_space(10.0);
-                egui::Frame::NONE
-                    .fill(theme::SIDEBAR_HOVER)
-                    .corner_radius(egui::CornerRadius::same(10))
-                    .inner_margin(egui::Margin::symmetric(11, 7))
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        // 显式 top_down：Frame 会继承外层的 bottom_up，导致
-                        // 预留高度虚增、与上方按钮的间隙不可控（实测 18px）。
-                        // 视觉顺序不变：详情在上、Git 同步在下。
-                        ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-                            ui.label(
-                                RichText::new(if app.push_queue.is_some() && !app.syncing {
-                                    format!("改动已暂存，{}后同步", remaining_str(app))
-                                } else {
-                                    detail.to_string()
-                                })
-                                .size(9.5)
-                                .color(Color32::from_rgb(126, 139, 168)),
-                            );
-                            ui.horizontal(|ui| {
-                                let (dot, _) = ui
-                                    .allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                                ui.painter().circle_filled(
-                                    dot.center(),
-                                    3.5,
-                                    if app.syncing { theme::WARN } else { theme::OK },
-                                );
-                                ui.label(
-                                    RichText::new(if app.syncing {
-                                        "正在同步"
-                                    } else if app.push_queue.is_some() {
-                                        "待推送"
-                                    } else {
-                                        mode
-                                    })
-                                    .size(11.5)
-                                    .strong()
-                                    .color(Color32::from_rgb(219, 225, 242)),
-                                );
-                            });
-                        });
-                    });
+                // 同步状态块：自绘（圆角矩形 + 文字）。
+                // 不用 egui::Frame——Frame 在 bottom_up 布局里预留高度失控
+                // （实测虚增到 300px+，把「工作台/统计列表」顶出屏幕）。
+                // 自绘用 allocate_exact_size 固定高度，完全可控。
+                {
+                    let w = ui.available_width();
+                    let h = 56.0;
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+                    let painter = ui.painter();
+                    painter.rect_filled(rect, egui::CornerRadius::same(10), theme::SIDEBAR_HOVER);
+                    // 详情行（上）
+                    painter.text(
+                        rect.left_top() + egui::vec2(11.0, 8.0),
+                        egui::Align2::LEFT_TOP,
+                        if app.push_queue.is_some() && !app.syncing {
+                            format!("改动已暂存，{}后同步", remaining_str(app))
+                        } else {
+                            detail.to_string()
+                        },
+                        egui::FontId::proportional(9.5),
+                        Color32::from_rgb(126, 139, 168),
+                    );
+                    // Git 同步行（下）：绿点 + 文字
+                    let line_y = rect.bottom() - 16.0;
+                    painter.circle_filled(
+                        egui::pos2(rect.left() + 14.5, line_y),
+                        3.5,
+                        if app.syncing { theme::WARN } else { theme::OK },
+                    );
+                    painter.text(
+                        egui::pos2(rect.left() + 26.0, line_y),
+                        egui::Align2::LEFT_CENTER,
+                        if app.syncing {
+                            "正在同步"
+                        } else if app.push_queue.is_some() {
+                            "待推送"
+                        } else {
+                            mode
+                        },
+                        egui::FontId::proportional(11.5),
+                        Color32::from_rgb(219, 225, 242),
+                    );
+                }
                 // 冲突副本入口：有副本时醒目（琥珀色），没有时弱化（仅 Git 模式显示）
-                // （bottom_up 布局：Frame 在此布局下顶部会多出 ~3px 预留，
-                //  实测校准用 1px，使与「设置与存储」的间隙一致）
-                ui.add_space(1.0);
+                ui.add_space(4.0);
                 if app.settings.kind == Kind::Git {
                     let count = app
                         .conflict_branches

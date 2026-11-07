@@ -2449,9 +2449,10 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             app.ym_picker_open = false;
         }
-    } else {
-        app.ym_picker_open = false;
     }
+    // ★ 把本地状态写回：点按钮 → open=true 必须存进 app，下一帧才知道面板开着。
+    //   （此前漏了这一步，面板「开一帧、灭一帧」，表现为点击毫无反应。）
+    app.ym_picker_open = open;
 }
 
 /// 年月选择浮层的容器：定位在触发按钮下方，卡片样式。

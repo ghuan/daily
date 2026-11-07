@@ -3032,10 +3032,24 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                 });
             });
             ui.add_space(28.0);
+            ui.label(
+                RichText::new("日程")
+                    .size(10.5)
+                    .strong()
+                    .color(Color32::from_rgb(116, 128, 158)),
+            );
+            ui.add_space(6.0);
             if nav_item(ui, "▦", "日期记录", app.page == WorkspacePage::Calendar).clicked() {
                 app.page = WorkspacePage::Calendar;
             }
-            ui.add_space(4.0);
+            ui.add_space(18.0);
+            ui.label(
+                RichText::new("工作台")
+                    .size(10.5)
+                    .strong()
+                    .color(Color32::from_rgb(116, 128, 158)),
+            );
+            ui.add_space(6.0);
             if nav_item(ui, "📊", "统计列表", app.page == WorkspacePage::Stats).clicked() {
                 app.page = WorkspacePage::Stats;
             }
@@ -7262,6 +7276,7 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
 
 
 

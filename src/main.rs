@@ -1233,8 +1233,8 @@ impl PlanApp {
             delete_prompt: None,
             record_delete_prompt: None,
             day_popup: None,
-            ym_picker_open: true,
-            ym_picker_mode: Some("year".into()),
+            ym_picker_open: false,
+            ym_picker_mode: None,
             day_popup_rect: None,
             show_settings: false,
             cfg_error: None,
@@ -5710,8 +5710,8 @@ mod workflow_tests {
             delete_prompt: None,
             record_delete_prompt: None,
             day_popup: None,
-            ym_picker_open: true,
-            ym_picker_mode: Some("year".into()),
+            ym_picker_open: false,
+            ym_picker_mode: None,
             day_popup_rect: None,
             show_settings: false,
             cfg_kind: Kind::Local,
@@ -6974,6 +6974,7 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
 
 
 

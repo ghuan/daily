@@ -635,18 +635,16 @@ fn build_backend(settings: &Settings) -> Backend {
     Backend { local, git }
 }
 
-/// 「立即同步」探测到远端有本地没有的新提交时，后台线程回传的哨兵错误文本。
-/// poll_sync 认得它，把它转成确认弹窗而不是报错。
-const PULL_NEEDS_CONFIRM: &str = "\u{1}pull-needs-confirm";
-
-/// 延迟推送的等待时长：增删改之后攒 5 分钟再真正 push。
+/// 防抖间隔：改动停止后 3 秒执行一轮同步（有道云笔记式）。
 ///
-/// 与有道云笔记的思路一致 —— 连续编辑期间不打网络，停手几分钟后一次推完。
-/// 每次新改动入队会**重置**这个计时（旧的排队消息被丢弃），所以实际的推送
-/// 时刻是「最后一次改动之后 5 分钟」。
-const PUSH_DELAY: Duration = Duration::from_secs(5 * 60);
+/// 有道云笔记的行为是「保存后几秒内同步到所有设备」——不是攒几分钟的大延迟，
+/// 而是一个很短的防抖窗口：连续编辑期间每次改动都会把窗口重置，停手 3 秒后
+/// 立即执行一轮 sync_round（本地改动推上去 + 远端新内容拉下来）。
+/// 比起 5 分钟长延迟：多端不一致的窗口从分钟级缩到秒级，且用户能立刻看到
+/// 侧栏绿点变回「已同步」。
+const PUSH_DELAY: Duration = Duration::from_secs(3);
 
-/// 延迟推送队列里的一条消息。
+/// 待同步标记（有道云笔记式）。
 ///
 /// 只需要知道「什么时候到期」和「提交说明写什么」；推送内容永远是当时的
 /// 本地数据目录（`bell-data/plans/`），所以中途再怎么改都会被下一次推送带上。
@@ -654,23 +652,20 @@ const PUSH_DELAY: Duration = Duration::from_secs(5 * 60);
 struct PushQueueEntry {
     /// 入队时刻。`elapsed() >= PUSH_DELAY` 即到期。
     queued_at: Instant,
-    /// 合并期间最后一次改动的描述（作为提交信息）。
+    /// 最后一次改动的描述（作为提交信息）。
     reason: String,
 }
 
-/// 延迟推送队列的语义（对应 `PlanApp::enqueue_push` / `poll_sync`）：
+/// 防抖同步的语义（对应 `PlanApp::enqueue_push` / `poll_sync`）：
 ///
 /// ```text
-/// 增删改 → enqueue_push
-///   ├─ 队列空           → 入队，开始计时
-///   ├─ 队列里有消息且    → 丢弃旧消息，新消息重新计时
-///   │  尚未开始推送      （连续编辑合并为一次推送）
-///   └─ 正在推送          → 消息排队；当前推送结束后照常执行
-///                           （执行时「先 pull 再 push」）
-/// ```
+/// 增删改 → persist 立即落盘 → enqueue_push（重置 3 秒窗口）
+///   ├─ 空闲且窗口到期 → sync_round：本地改动 push + 远端新内容 pull
+///   └─ 正在同步       → 标记保留；本轮结束后下一秒 tick 再查
+ /// ```
 ///
-/// 注意「正在推送」的判断用的是 `syncing` 标志 —— 它覆盖了启动拉取、手动
-/// 同步、切换存储等所有后台任务，因此不会出现「边推边改边拉」的交错。
+ /// 冲突（两边都有改动）不弹窗打断：生成「冲突副本」后照常同步，见
+ /// `sync_round_with_conflict_copy`。
 
 /// 后台同步任务的回报。
 enum SyncMsg {
@@ -1074,8 +1069,6 @@ struct PlanApp {
     /// 有道云笔记式的**延迟推送队列**：增删改只入队，攒 5 分钟再真正 push
     ///（见 `PushQueueEntry`）。`None` = 队列里没有待推送的消息。
     push_queue: Option<PushQueueEntry>,
-    /// 「立即同步」探测到远端有本地没有的新提交，等待用户确认是否覆盖本地。
-    pending_pull_confirm: bool,
     sync_tx: Sender<SyncMsg>,
     sync_rx: Receiver<SyncMsg>,
 
@@ -1202,7 +1195,6 @@ impl PlanApp {
             status: None,
             syncing: startup_pull,
             push_queue: None,
-            pending_pull_confirm: false,
             sync_tx,
             sync_rx,
             tray: None,
@@ -1275,7 +1267,6 @@ impl PlanApp {
             return;
         }
         self.syncing = true;
-        self.pending_pull_confirm = false;
         let settings = self.settings.clone();
         let tx = self.sync_tx.clone();
         let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
@@ -1287,7 +1278,9 @@ impl PlanApp {
                     store::SyncOutcome::Pushed => "已推送到 Git".to_string(),
                     store::SyncOutcome::Pulled => "已从 Git 拉取最新".to_string(),
                     store::SyncOutcome::Noop => "已是最新，无需同步".to_string(),
-                    store::SyncOutcome::Conflict => PULL_NEEDS_CONFIRM.to_string(),
+                    store::SyncOutcome::ConflictCopied => {
+                        "同步冲突：本机改动已存为冲突副本（conflict/ 分支），主数据已更新为远端".to_string()
+                    }
                 })
                 .map_err(|e| e.to_string());
             let _ = tx.send(SyncMsg::Finished("sync", res));
@@ -1304,43 +1297,6 @@ impl PlanApp {
         self.run_due_push("手动同步".to_string());
     }
 
-    /// 冲突解决（确认框）：**用远端** —— 拉取远端内容覆盖本机数据目录。
-    fn resolve_conflict_take_remote(&mut self) {
-        if self.syncing || self.settings.kind != Kind::Git {
-            return;
-        }
-        self.syncing = true;
-        let settings = self.settings.clone();
-        let tx = self.sync_tx.clone();
-        let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
-        std::thread::spawn(move || {
-            let git = GitStore::new(local_dir, settings.git.clone());
-            let res = git
-                .pull()
-                .map(|_| "已采用远端数据（本机未推送改动已丢弃）".to_string())
-                .map_err(|e| e.to_string());
-            let _ = tx.send(SyncMsg::Finished("pull", res));
-        });
-    }
-
-    /// 冲突解决（确认框）：**用本机** —— 本机当前数据整份推上远端。
-    fn resolve_conflict_keep_local(&mut self) {
-        if self.syncing || self.settings.kind != Kind::Git {
-            return;
-        }
-        self.syncing = true;
-        let settings = self.settings.clone();
-        let tx = self.sync_tx.clone();
-        let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
-        std::thread::spawn(move || {
-            let git = GitStore::new(local_dir, settings.git.clone());
-            let res = git
-                .push("解决冲突：保留本机改动")
-                .map(|_| "已推送本机数据（远端内容被覆盖，历史可回溯）".to_string())
-                .map_err(|e| e.to_string());
-            let _ = tx.send(SyncMsg::Finished("push", res));
-        });
-    }
 
     fn poll_sync(&mut self) {
         while let Ok(msg) = self.sync_rx.try_recv() {
@@ -1365,16 +1321,7 @@ impl PlanApp {
                                 }
                             }
                         }
-                        Err(e) => {
-                            // 真分叉：不是失败，转成确认弹窗。用户在弹窗里选
-                            // 「用远端」或「用本机」，见 ui_pull_confirm_dialog。
-                            if e.to_string().contains(PULL_NEEDS_CONFIRM) {
-                                self.pending_pull_confirm = true;
-                                request_ui_wake();
-                                continue;
-                            }
-                            self.set_status(format!("同步失败：{e}"), false);
-                        }
+                        Err(e) => self.set_status(format!("同步失败：{e}"), false),
                     }
                 }
                 SyncMsg::Switched(res) => {
@@ -1989,7 +1936,6 @@ impl eframe::App for PlanApp {
         ui_delete_template_dialog(self, ctx);
         ui_record_delete_dialog(self, ctx);
         ui_settings(self, ctx);
-        ui_pull_confirm_dialog(self, ctx);
         ui_popups(self, ctx);
 
         ctx.request_repaint_after(Duration::from_secs(1));
@@ -2676,7 +2622,7 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                         });
                         ui.label(
                             RichText::new(if app.push_queue.is_some() && !app.syncing {
-                                format!("改动已暂存，{}后推送", remaining_str(app))
+                                format!("改动已暂存，{}后同步", remaining_str(app))
                             } else {
                                 detail.to_string()
                             })
@@ -3974,17 +3920,12 @@ fn ui_status_line(app: &mut PlanApp, ui: &mut egui::Ui) {
     });
 }
 
-/// 延迟队列里距推送还有多久（用于侧栏「改动已暂存，X后推送」）。
+/// 防抖窗口里距同步还有多久（用于侧栏「改动已暂存，X后同步」）。
 fn remaining_str(app: &PlanApp) -> String {
     match &app.push_queue {
         Some(entry) => {
             let left = PUSH_DELAY.saturating_sub(entry.queued_at.elapsed());
-            let mins = (left.as_secs() + 59) / 60; // 向上取整到分钟
-            if mins <= 1 {
-                "不到 1 分钟".to_string()
-            } else {
-                format!("{mins} 分钟")
-            }
+            format!("{} 秒", left.as_secs().max(1))
         }
         None => "—".to_string(),
     }
@@ -5275,7 +5216,6 @@ mod workflow_tests {
             status: None,
             syncing: false,
             push_queue: None,
-            pending_pull_confirm: false,
             sync_tx,
             sync_rx,
             tray: None,
@@ -5586,64 +5526,6 @@ mod workflow_tests {
     }
 }
 // ============================== 设置对话框 ==============================
-
-/// 「立即同步」探测到**真分叉**时的确认弹窗。
-///
-/// 必须是独立窗口：早期版本画在主界面状态行里，会被设置弹窗整个盖住 ——
-/// 用户点「立即同步」后什么都没看到，还以为同步失效了。
-fn ui_pull_confirm_dialog(app: &mut PlanApp, ctx: &egui::Context) {
-    if !app.pending_pull_confirm {
-        return;
-    }
-    let mut open = true;
-    egui::Window::new("⚠ 同步确认")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .title_bar(false)
-        .frame(
-            egui::Frame::window(&ctx.global_style())
-                .fill(theme::CARD)
-                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
-                .corner_radius(egui::CornerRadius::same(14))
-                .inner_margin(egui::Margin::same(18)),
-        )
-        .open(&mut open)
-        .show(ctx, |ui| {
-            ui.set_min_width(420.0);
-            ui.label(RichText::new("同步确认").size(18.0).strong().color(theme::TEXT));
-            ui.add_space(10.0);
-            ui.label(
-                RichText::new(
-                    "本机与远端都有对方没有的改动。拉取远端数据会覆盖本机尚未推送的修改\n（另一台电脑可能正在使用）。",
-                )
-                .size(13.0)
-                .color(theme::TEXT_WEAK),
-            );
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                // 用远端：拉取远端数据覆盖本机（本机未推送的改动丢弃）
-                if ui.add(button_primary("用远端（覆盖本机）")).clicked() {
-                    app.pending_pull_confirm = false;
-                    app.resolve_conflict_take_remote();
-                }
-                // 用本机：把本机当前数据整份推上去（远端那几条新提交的内容被覆盖，
-                // 但提交历史还在，可回溯）
-                if ui.add(button_ghost("用本机（覆盖远端）")).clicked() {
-                    app.pending_pull_confirm = false;
-                    app.resolve_conflict_keep_local();
-                }
-                if ui.add(button_ghost("取消")).clicked() {
-                    app.pending_pull_confirm = false;
-                    app.set_status("已取消同步，两边改动都保留在各自机器上".into(), true);
-                }
-            });
-        });
-    if !open {
-        app.pending_pull_confirm = false;
-    }
-}
-
 fn ui_settings(app: &mut PlanApp, ctx: &egui::Context) {
     if !app.show_settings {
         return;
@@ -6291,6 +6173,10 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
+
 
 
 

@@ -568,7 +568,7 @@ impl GitStore {
         Ok(out.trim().parse().unwrap_or(0))
     }
 
-    /// 一轮「拉取 + 推送」的智能同步。
+    /// 一轮「拉取 + 推送」的智能同步（有道云笔记式冲突处理）。
     ///
     /// 与 `push`（无脑用本地覆盖远端）不同，这里先**分别探测**两边：
     ///
@@ -577,11 +577,12 @@ impl GitStore {
     /// | ✗ | ✗ | `Noop` |
     /// | ✓ | ✗ | 直接推送（`Pushed`） |
     /// | ✗ | ✓ | `reset --hard` 到远端（数据目录直接变成远端内容），返回 `Pulled` |
-    /// | ✓ | ✓ | **`Conflict`** —— 没有合并能力，整份覆盖必然丢一边，交给用户选 |
+    /// | ✓ | ✓ | **冲突副本**：本机版本先 commit 到一个 `conflict/` 分支留底，
+    ///   然后照常 reset 到远端。本机改动不丢（在分支里），同步不被打断 |
     ///
-    /// 为什么不「先 pull 再 push」：延迟队列的消息本身就意味着本地有未推送
-    /// 改动，先 pull 会用远端全量数据把它冲掉（实测踩过：勾选的完成状态
-    /// 被悄悄还原）。数据层是「整份覆盖」模型，拉和推不能同时成立。
+    /// 有道云笔记的冲突策略是「生成冲突副本，保留两个版本」，用户事后自行
+    /// 核对合并 —— 从不打断正在编辑的人。这里用 git 分支实现同样的语义：
+    /// 本机改动永远在 `conflict/<时间戳>` 分支里可找回，主数据跟随远端。
     pub fn sync_round(&self, message: &str) -> Result<SyncOutcome> {
         self.prepare()?;
         let branch = self.cfg.branch.trim().to_string();
@@ -600,8 +601,26 @@ impl GitStore {
                 Ok(SyncOutcome::Pulled)
             }
             (true, true) => {
-                // 冲突：什么都不动，交给用户决定
-                Ok(SyncOutcome::Conflict)
+                // 冲突 → 冲突副本：本机当前状态存进 conflict 分支留底，
+                // 然后主数据对齐远端（Pulled），同步流程不中断。
+                let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+                let conflict_branch = format!("conflict/{}", stamp);
+                self.run(&["checkout", "-b", &conflict_branch])?;
+                self.run(&["add", "-A"])?;
+                self.run(&[
+                    "-c",
+                    "user.name=bell-reminder",
+                    "-c",
+                    "user.email=daily@local",
+                    "commit",
+                    "-m",
+                    &format!("冲突副本：本机改动（原准备：{}）", message),
+                ])?;
+                // 回到主分支并对齐远端；冲突分支留在本地（也推到远端，多机都能看到）
+                self.run(&["checkout", &branch])?;
+                let _ = self.run(&["push", "origin", &conflict_branch]);
+                self.pull()?;
+                Ok(SyncOutcome::ConflictCopied)
             }
         }
     }
@@ -682,11 +701,11 @@ fn redact(text: &str, cfg: &GitConfig) -> String {
 pub enum SyncOutcome {
     /// 本地有改动且远端无新内容：已推送。
     Pushed,
-    /// 本地无改动且远端有新内容：中转副本已对齐到远端，
-    /// 调用方需要把远端内容写回本地数据目录并重新读盘。
+    /// 本地无改动且远端有新内容：数据目录已对齐到远端，
+    /// 调用方需要重新读盘刷新界面。
     Pulled,
-    /// 两边都有改动：需要用户决定覆盖方向，什么都没动。
-    Conflict,
+    /// 两边都有改动：本机版本已存为冲突分支留底，主数据已对齐远端。
+    ConflictCopied,
     /// 两边都没有改动。
     Noop,
 }
@@ -1132,9 +1151,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// sync_round 四象限：两边都有改动 → Conflict，且两边数据都没被破坏。
+    /// sync_round 冲突：两边都有改动 → 本机版本存入 conflict/ 分支留底，
+    /// 主数据对齐远端，流程不中断（有道云笔记「冲突副本」语义）。
     #[test]
-    fn sync_round_reports_conflict_without_touching_data() {
+    fn sync_round_saves_conflict_copy_and_follows_remote() {
         use crate::model::DayRecord;
         if !git_available() { return; }
         let base = temp_dir();
@@ -1164,14 +1184,22 @@ mod tests {
         ldoc.records.push(DayRecord::from_template(&t2, chrono::NaiveDate::from_ymd_opt(2026,11,7).unwrap()));
         ds.save(&ldoc).unwrap();
 
-        assert_eq!(git.sync_round("x").unwrap(), SyncOutcome::Conflict);
+        assert_eq!(git.sync_round("x").unwrap(), SyncOutcome::ConflictCopied);
 
-        // 冲突后两边数据都应完好：远端有「远端改动」，本地文件有「本机改动」
-        let check = GitStore::new(base.join("check"), cfg);
-        check.prepare().unwrap();
-        check.pull().unwrap();
-        assert!(std::fs::read_to_string(base.join("check").join("2026.json")).unwrap().contains("远端改动"));
-        assert!(std::fs::read_to_string(base.join("w").join("2026.json")).unwrap().contains("本机改动"));
+        // ① 主数据已对齐远端：包含「远端改动」，不含「本机改动」
+        let main_text = std::fs::read_to_string(base.join("w").join("2026.json")).unwrap();
+        assert!(main_text.contains("远端改动"), "主数据应含远端改动");
+        assert!(!main_text.contains("本机改动"), "主数据不应再含本机改动");
+
+        // ② 本机改动没有丢：在 conflict/ 分支里
+        let branches = git.run(&["branch", "--list", "conflict/*"]).unwrap();
+        assert!(branches.contains("conflict/"), "应存在 conflict 分支：{}", branches);
+        let saved = git.run(&["show", &format!("{}:2026.json", branches.split_whitespace().find(|b| b.starts_with("conflict/")).unwrap().trim())]).unwrap();
+        assert!(saved.contains("本机改动"), "冲突副本应包含本机改动");
+
+        // ③ 当前在主分支上
+        let cur = git.run(&["branch", "--show-current"]).unwrap();
+        assert_eq!(cur.trim(), "main");
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -1144,6 +1144,8 @@ struct PlanApp {
     stats_filter: u8,
     /// 统计页：当前页码。
     stats_page: usize,
+    /// 统计页：每页显示条数。
+    stats_per_page: usize,
     /// 弹窗刚被打开的帧标记：这一帧的点击是「打开动作本身」，
     /// 外点检测必须跳过，否则弹窗会被同一次点击立即关闭。
     dialog_just_opened: bool,
@@ -1292,6 +1294,7 @@ impl PlanApp {
             stats_end_month: Local::now().date_naive(),
             stats_filter: 0,
             stats_page: 0,
+            stats_per_page: 20,
             dialog_just_opened: false,
             conflict_view: None,
             conflict_doc: None,
@@ -4395,7 +4398,7 @@ fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                 }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // 分页：上一页 / 下一页
-                    let per_page = 20usize;
+                    let per_page = app.stats_per_page;
                     let pages = shown.len().div_ceil(per_page).max(1);
                     if app.stats_page >= pages {
                         app.stats_page = pages - 1;
@@ -4411,13 +4414,32 @@ fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                     if ui.add(button_mini("下一页 ›")).clicked() && app.stats_page + 1 < pages {
                         app.stats_page += 1;
                     }
+                    ui.add_space(10.0);
+                    // 每页条数：10 / 20 / 50 / 100
+                    let before = app.stats_per_page;
+                    egui::ComboBox::from_id_salt("stats_per_page")
+                        .selected_text(format!("{} 条/页", app.stats_per_page))
+                        .width(90.0)
+                        .show_ui(ui, |ui| {
+                            for n in [10usize, 20, 50, 100] {
+                                ui.selectable_value(
+                                    &mut app.stats_per_page,
+                                    n,
+                                    format!("{} 条/页", n),
+                                );
+                            }
+                        });
+                    if app.stats_per_page != before {
+                        // 改每页条数后回到第一页，避免停在越界页
+                        app.stats_page = 0;
+                    }
                 });
             });
             ui.add_space(8.0);
 
             // ---- 明细分页列表 ----
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let per_page = 20usize;
+                let per_page = app.stats_per_page;
                 let skip = app.stats_page * per_page;
                 let page_items: Vec<&DayRecord> =
                     shown.iter().skip(skip).take(per_page).copied().collect();
@@ -6113,6 +6135,7 @@ mod workflow_tests {
             stats_end_month: Local::now().date_naive(),
             stats_filter: 0,
             stats_page: 0,
+            stats_per_page: 20,
             dialog_just_opened: false,
             conflict_view: None,
             conflict_doc: None,
@@ -7361,6 +7384,7 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
 
 
 

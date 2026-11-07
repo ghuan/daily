@@ -2375,54 +2375,32 @@ fn date_picker(
 fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) {
     let mut open = app.ym_picker_open;
 
-    // 两个可点的文字按钮：年份、月份
-    let year_btn = {
-        let inner = egui::Frame::NONE
-            .fill(if open && app.ym_picker_mode.as_deref() == Some("year") {
-                theme::ACCENT_SOFT
-            } else {
-                Color32::TRANSPARENT
-            })
-            .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(4, 2))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(format!("{} 年", selected.year()))
-                        .size(16.0)
-                        .strong()
-                        .color(theme::TEXT),
-                );
-            });
-        let r = inner.response.interact(egui::Sense::click());
-        if r.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        r
-    };
+    // 两个可点的文字按钮：年份、月份（真实 Button，交互路径与月历格子一致）
+    let year_active = open && app.ym_picker_mode.as_deref() == Some("year");
+    let year_btn = ui.add(
+        egui::Button::new(
+            RichText::new(format!("{} 年", selected.year()))
+                .size(16.0)
+                .strong()
+                .color(theme::TEXT),
+        )
+        .fill(if year_active { theme::ACCENT_SOFT } else { Color32::TRANSPARENT })
+        .corner_radius(egui::CornerRadius::same(6))
+        .min_size(egui::vec2(0.0, 26.0)),
+    );
     ui.add_space(2.0);
-    let month_btn = {
-        let inner = egui::Frame::NONE
-            .fill(if open && app.ym_picker_mode.as_deref() == Some("month") {
-                theme::ACCENT_SOFT
-            } else {
-                Color32::TRANSPARENT
-            })
-            .corner_radius(egui::CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(4, 2))
-            .show(ui, |ui| {
-                ui.label(
-                    RichText::new(format!("{} 月", selected.month()))
-                        .size(16.0)
-                        .strong()
-                        .color(theme::TEXT),
-                );
-            });
-        let r = inner.response.interact(egui::Sense::click());
-        if r.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        r
-    };
+    let month_active = open && app.ym_picker_mode.as_deref() == Some("month");
+    let month_btn = ui.add(
+        egui::Button::new(
+            RichText::new(format!("{} 月", selected.month()))
+                .size(16.0)
+                .strong()
+                .color(theme::TEXT),
+        )
+        .fill(if month_active { theme::ACCENT_SOFT } else { Color32::TRANSPARENT })
+        .corner_radius(egui::CornerRadius::same(6))
+        .min_size(egui::vec2(0.0, 26.0)),
+    );
 
     let clicked = if year_btn.clicked() {
         Some("year")
@@ -2431,12 +2409,14 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
     } else {
         None
     };
+    let mut just_opened = false;
     if let Some(kind) = clicked {
         // 两个面板互斥：点年份关月份，点月份关年份
         if open && app.ym_picker_mode.as_deref() == Some(kind) {
             open = false;
         } else {
             open = true;
+            just_opened = true; // 打开的当帧跳过「点外部收起」检查，否则会被同一帧的点击立即关掉
             app.ym_picker_mode = Some(kind.to_string());
         }
     }
@@ -2457,8 +2437,9 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
             });
             (r, area)
         };
-        // 点浮层和按钮之外 → 收起
-        if ui.input(|i| i.pointer.any_click()) {
+        // 点浮层和按钮之外 → 收起。打开的当帧跳过（just_opened），
+        // 否则触发打开的那次点击会被同帧判定为「点了外面」把面板立即关掉。
+        if !just_opened && ui.input(|i| i.pointer.any_click()) {
             if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
                 if !area_resp.contains(p) && !rect.contains(p) {
                     app.ym_picker_open = false;

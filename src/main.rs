@@ -3185,9 +3185,6 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if app.date_view == DateView::Calendar {
-                        // 提示行放在月历上方：月历本身很高，放在下面会被挤出可视区。
-                        ui_calendar_hint(app, ui, today);
-                        ui.add_space(8.0);
                         ui_month_grid(app, ui, today);
                     } else {
                         let mut cursor = start;
@@ -3201,65 +3198,6 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                     }
                 });
         });
-}
-
-/// 日历下方的一行说明 + 当天概览。
-///
-/// 当天明细已经搬进「双击格子」弹出的窗口，这里只留一条可点的入口，
-/// 免得月历被下面一长串卡片顶得看不见。
-fn ui_calendar_hint(app: &mut PlanApp, ui: &mut egui::Ui, today: NaiveDate) {
-    let date = app.selected_date;
-    let (done, total) = app.record_progress(date);
-    let mut open = false;
-    egui::Frame::NONE
-        .fill(theme::CARD)
-        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(12, 9))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(format!(
-                        "{}  周{}",
-                        date.format("%m月%d日"),
-                        weekday_cn(date)
-                    ))
-                    .size(13.0)
-                    .strong()
-                    .color(if date == today {
-                        theme::ACCENT
-                    } else {
-                        theme::TEXT
-                    }),
-                );
-                if date == today {
-                    badge(ui, "今天", theme::ACCENT, theme::ACCENT_SOFT);
-                }
-                badge(
-                    ui,
-                    &format!("{done}/{total}"),
-                    if total > 0 && done == total {
-                        theme::OK
-                    } else {
-                        theme::TEXT_WEAK
-                    },
-                    if total > 0 && done == total {
-                        theme::OK_DIM
-                    } else {
-                        theme::CARD_HOVER
-                    },
-                );
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(button_mini("打开当天记录")).clicked() {
-                        open = true;
-                    }
-                });
-            });
-        });
-    if open {
-        app.day_popup = Some(date);
-    }
 }
 
 /// 双击日历格子弹出的「当天记录」窗口：内容与日期页一致，只是独立成窗。

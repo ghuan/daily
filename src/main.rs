@@ -1099,8 +1099,6 @@ struct PlanApp {
     conflict_doc: Option<Doc>,
     /// 加载副本内容出错的信息。
     conflict_error: Option<String>,
-    /// 标记了「待恢复」的记录 id（副本里有、主数据没有）。
-    conflict_restore: std::collections::HashSet<Uuid>,
     sync_tx: Sender<SyncMsg>,
     sync_rx: Receiver<SyncMsg>,
 
@@ -1231,7 +1229,6 @@ impl PlanApp {
             conflict_view: None,
             conflict_doc: None,
             conflict_error: None,
-            conflict_restore: std::collections::HashSet::new(),
             frames_drawn: 0,
             status: None,
             syncing: startup_pull,
@@ -1338,75 +1335,23 @@ impl PlanApp {
         self.run_due_push("手动同步".to_string());
     }
 
-    /// 打开冲突副本管理：请求清单（缓存里有就直接用），并复位视图状态。
-    fn open_conflicts(&mut self) {
-        self.show_conflicts = true;
-        self.conflict_view = None;
-        self.conflict_doc = None;
-        self.conflict_error = None;
-        self.conflict_restore.clear();
-        if self.conflict_branches.is_none() {
-            self.refresh_conflict_list();
-        }
-    }
-
-    /// 选中一份副本：后台读出它的完整数据供对比。
-    fn view_conflict(&mut self, branch: String) {
-        if self.syncing {
+    /// 后台检测冲突副本分支并更新缓存。
+    ///
+    /// 由 tick 低频调用（每 30 秒一次）、每次 sync_round 结束后立即调用一次。
+    /// 检测本身是本地 git for-each-ref，很快，但也不该在 UI 线程跑。
+    fn refresh_conflict_list(&mut self) {
+        if self.conflict_scan_running || self.settings.kind != Kind::Git {
             return;
         }
-        self.syncing = true;
-        self.conflict_error = None;
-        self.conflict_doc = None;
-        self.conflict_restore.clear();
+        self.conflict_scan_running = true;
         let settings = self.settings.clone();
         let tx = self.sync_tx.clone();
         let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
         std::thread::spawn(move || {
             let git = GitStore::new(local_dir, settings.git.clone());
-            let doc = git.load_conflict_doc(&branch).map_err(|e| e.to_string());
-            let _ = tx.send(SyncMsg::ConflictDoc { branch, doc });
+            let list = git.list_conflict_branches().unwrap_or_default();
+            let _ = tx.send(SyncMsg::ConflictList(list));
         });
-    }
-
-    /// 把勾选的记录从副本恢复到主数据。
-    ///
-    /// 恢复 = 把副本里的记录（按 id）写回当前 doc，然后照常 save_and_sync
-    /// 入队同步。冲突本身不用「解决」——主数据已经被同步过了，这只是把
-    /// 用户挑中的改动补回来。
-    fn restore_conflict_records(&mut self) {
-        let Some(conflict_doc) = &self.conflict_doc else {
-            return;
-        };
-        let ids = self.conflict_restore.clone();
-        if ids.is_empty() {
-            return;
-        }
-        let mut restored = 0;
-        for record in &conflict_doc.records {
-            if !ids.contains(&record.id) {
-                continue;
-            }
-            // 主数据里已有同 id（理论上不会，差集才显示）就跳过
-            if self.doc.record(record.id).is_some() {
-                continue;
-            }
-            self.doc.records.push(record.clone());
-            restored += 1;
-        }
-        // 副本里新增的标签字典项也带回来（记录的 tag 下拉需要）
-        for tag in &conflict_doc.tags {
-            self.doc.remember_tag(tag);
-        }
-        if restored > 0 {
-            let reason = format!("恢复冲突副本中的 {} 条记录", restored);
-            self.save_and_sync(&reason);
-            self.set_status(format!("已恢复 {} 条记录，将随队列同步", restored), true);
-        }
-        // 清空视图回到列表
-        self.conflict_view = None;
-        self.conflict_doc = None;
-        self.conflict_restore.clear();
     }
 
     /// 删除一份冲突副本（后台）。
@@ -1434,28 +1379,58 @@ impl PlanApp {
         if self.conflict_view.as_deref() == Some(branch.as_str()) {
             self.conflict_view = None;
             self.conflict_doc = None;
-            self.conflict_restore.clear();
+        }
+    }
+    /// 打开冲突副本管理：请求清单（缓存里有就直接用），并复位视图状态。
+    fn open_conflicts(&mut self) {
+        self.show_conflicts = true;
+        self.conflict_view = None;
+        self.conflict_doc = None;
+        self.conflict_error = None;
+        if self.conflict_branches.is_none() {
+            self.refresh_conflict_list();
         }
     }
 
-    /// 后台检测冲突副本分支并更新缓存。
-    /// 由 tick 低频调用（每 30 秒一次）、每次 sync_round 结束后立即调用一次。
-    /// 检测本身是本地 git for-each-ref，很快，但也不该在 UI 线程跑。
-    fn refresh_conflict_list(&mut self) {
-        if self.conflict_scan_running || self.settings.kind != Kind::Git {
+    /// 选中一份副本：后台读出它的完整数据供对比。
+    fn view_conflict(&mut self, branch: String) {
+        if self.syncing {
             return;
         }
-        self.conflict_scan_running = true;
+        self.syncing = true;
+        self.conflict_error = None;
+        self.conflict_doc = None;
         let settings = self.settings.clone();
         let tx = self.sync_tx.clone();
         let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
         std::thread::spawn(move || {
             let git = GitStore::new(local_dir, settings.git.clone());
-            let list = git.list_conflict_branches().unwrap_or_default();
-            let _ = tx.send(SyncMsg::ConflictList(list));
+            let doc = git.load_conflict_doc(&branch).map_err(|e| e.to_string());
+            let _ = tx.send(SyncMsg::ConflictDoc { branch, doc });
         });
     }
 
+    /// 「用副本覆盖当前」：当前数据整份替换为副本内容，并照常入队同步。
+    ///
+    /// 覆盖后副本分支使命完成，顺带删除。
+    fn apply_conflict_overwrite(&mut self) {
+        let Some(conflict_doc) = self.conflict_doc.clone() else {
+            return;
+        };
+        let Some(branch) = self.conflict_view.clone() else {
+            return;
+        };
+        self.doc = conflict_doc;
+        self.popups.clear();
+        self.save_and_sync("用冲突副本覆盖当前数据");
+        self.set_status("已用副本覆盖当前数据，将自动同步".into(), true);
+        // 副本已被采纳，删除
+        self.delete_conflict(branch);
+        // 回到列表视图
+        self.conflict_view = None;
+        self.conflict_doc = None;
+        self.conflict_error = None;
+    }
 
     fn poll_sync(&mut self) {
         while let Ok(msg) = self.sync_rx.try_recv() {
@@ -5470,7 +5445,6 @@ mod workflow_tests {
             conflict_view: None,
             conflict_doc: None,
             conflict_error: None,
-            conflict_restore: std::collections::HashSet::new(),
             frames_drawn: 0,
             status: None,
             syncing: false,
@@ -5902,13 +5876,16 @@ fn ui_conflicts_dialog(app: &mut PlanApp, ctx: &egui::Context) {
     }
 }
 
-/// 单份副本的详情视图：与主数据的记录级差异 + 恢复/返回。
+/// 单份副本的详情视图：差异摘要 + 两个大按钮（覆盖 / 删除）。
+///
+/// 有道式简化：不提供勾选恢复等细粒度操作，只有两个明确的方向——
+/// 「用这份副本」或「不要了」。差异列表仍然展示，但只是信息，
+/// 不承载操作。
 fn ui_conflict_detail(app: &mut PlanApp, ui: &mut egui::Ui, branch: &str) {
     // 返回列表
     if ui.add(button_ghost("← 返回列表")).clicked() {
         app.conflict_view = None;
         app.conflict_doc = None;
-        app.conflict_restore.clear();
         return;
     }
     ui.add_space(6.0);
@@ -5917,32 +5894,34 @@ fn ui_conflict_detail(app: &mut PlanApp, ui: &mut egui::Ui, branch: &str) {
         ui.colored_label(theme::DANGER, format!("读取副本失败：{err}"));
         return;
     }
-    let Some(conflict_doc) = &app.conflict_doc else {
+    let Some(conflict_doc) = app.conflict_doc.clone() else {
         ui.label(RichText::new("正在读取副本内容…").small().color(theme::TEXT_WEAK));
         return;
     };
 
-    // 记录级差异：副本里有、主数据没有（按 id）；以及同 id 但内容不同的
-    let mut added: Vec<&crate::model::DayRecord> = Vec::new();
-    let mut changed: Vec<(&crate::model::DayRecord, &crate::model::DayRecord)> = Vec::new();
+    // 记录级差异（只做信息展示）：副本独有 / 内容不同 / 当前独有
+    // 先把差集算完并克隆成自有数据，后面才能可变借用 app（按钮回调）。
+    let mut added: Vec<crate::model::DayRecord> = Vec::new();
+    let mut changed: Vec<(crate::model::DayRecord, crate::model::DayRecord)> = Vec::new();
     let mut same = 0;
     for rec in &conflict_doc.records {
         match app.doc.record(rec.id) {
-            None => added.push(rec),
+            None => added.push(rec.clone()),
             Some(cur) => {
                 if cur.done != rec.done || cur.title != rec.title || cur.note != rec.note {
-                    changed.push((rec, cur));
+                    changed.push((rec.clone(), cur.clone()));
                 } else {
                     same += 1;
                 }
             }
         }
     }
-    let removed: Vec<&crate::model::DayRecord> = app
+    let removed: Vec<crate::model::DayRecord> = app
         .doc
         .records
         .iter()
         .filter(|cur| conflict_doc.record(cur.id).is_none())
+        .cloned()
         .collect();
 
     ui.label(
@@ -5958,59 +5937,41 @@ fn ui_conflict_detail(app: &mut PlanApp, ui: &mut egui::Ui, branch: &str) {
         .size(11.5)
         .color(theme::TEXT_WEAK),
     );
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 
-    // 副本里有（本机当时的改动，主数据没有）→ 可勾选恢复
-    if !added.is_empty() {
-        ui.label(RichText::new("副本独有的记录（勾选后可恢复）：").strong().color(theme::TEXT));
-        egui::ScrollArea::vertical().id_salt("cf-added").max_height(150.0).show(ui, |ui| {
+    // 差异明细（只读，紧凑）
+    egui::ScrollArea::vertical().id_salt("cf-detail").max_height(260.0).show(ui, |ui| {
+        if !added.is_empty() {
+            ui.label(
+                RichText::new(format!("副本独有的 {} 条：", added.len()))
+                    .strong()
+                    .color(theme::TEXT),
+            );
             for rec in &added {
-                ui.horizontal(|ui| {
-                    let mut checked = app.conflict_restore.contains(&rec.id);
-                    if ui.checkbox(&mut checked, "").changed() {
-                        if checked {
-                            app.conflict_restore.insert(rec.id);
-                        } else {
-                            app.conflict_restore.remove(&rec.id);
-                        }
-                    }
-                    ui.label(
-                        RichText::new(format!(
-                            "{}  {}  {}（{}）",
-                            rec.date,
-                            if rec.done { "✓" } else { "○" },
-                            rec.title,
-                            rec.tag
-                        ))
-                        .size(12.0)
-                        .color(theme::TEXT),
-                    );
-                });
+                ui.label(
+                    RichText::new(format!(
+                        "    {}  {}  {}（{}）",
+                        rec.date,
+                        if rec.done { "✓" } else { "○" },
+                        rec.title,
+                        rec.tag
+                    ))
+                    .size(12.0)
+                    .color(theme::TEXT),
+                );
             }
-        });
-        ui.add_space(4.0);
-        if app.conflict_restore.is_empty() {
-            ui.add_enabled(false, button_primary("恢复选中的记录"));
-        } else {
-            if ui
-                .add(button_primary(format!("恢复选中的 {} 条", app.conflict_restore.len()).leak()))
-                .clicked()
-            {
-                app.restore_conflict_records();
-                return;
-            }
+            ui.add_space(6.0);
         }
-        ui.add_space(6.0);
-    }
-
-    // 同 id 但内容不同（只读展示）
-    if !changed.is_empty() {
-        ui.label(RichText::new("两边都有但内容不同（副本版本 → 当前版本）：").strong().color(theme::TEXT));
-        egui::ScrollArea::vertical().id_salt("cf-changed").max_height(120.0).show(ui, |ui| {
+        if !changed.is_empty() {
+            ui.label(
+                RichText::new(format!("内容不同的 {} 条（副本 → 当前）：", changed.len()))
+                    .strong()
+                    .color(theme::TEXT),
+            );
             for (cf, cur) in &changed {
                 ui.label(
                     RichText::new(format!(
-                        "{}  「{}」{} → 「{}」{}",
+                        "    {}  「{}」{} → 「{}」{}",
                         cf.date,
                         cf.title,
                         if cf.done { "已完成" } else { "未完成" },
@@ -6021,39 +5982,55 @@ fn ui_conflict_detail(app: &mut PlanApp, ui: &mut egui::Ui, branch: &str) {
                     .color(theme::TEXT_WEAK),
                 );
             }
-        });
-        ui.add_space(6.0);
-    }
-
-    // 当前独有（另一台的改动已在主数据里，提示不需要动）
-    if !removed.is_empty() {
-        ui.label(
-            RichText::new(format!(
-                "当前独有 {} 条（另一台的改动，已在主数据中，无需处理）",
-                removed.len()
-            ))
-            .size(11.5)
-            .color(theme::TEXT_WEAK),
-        );
-        ui.add_space(6.0);
-    }
-
-    if added.is_empty() && changed.is_empty() {
-        ui.label(
-            RichText::new("这份副本与当前数据没有差异，可以直接删除。")
-                .size(12.5)
+            ui.add_space(6.0);
+        }
+        if !removed.is_empty() {
+            ui.label(
+                RichText::new(format!(
+                    "当前独有的 {} 条（另一台的改动，选「删除副本」不影响它们）",
+                    removed.len()
+                ))
+                .size(11.5)
                 .color(theme::TEXT_WEAK),
-        );
-        ui.add_space(8.0);
-    }
+            );
+        }
+        if added.is_empty() && changed.is_empty() {
+            ui.label(
+                RichText::new("这份副本与当前数据没有差异。")
+                    .size(12.5)
+                    .color(theme::TEXT_WEAK),
+            );
+        }
+    });
 
+    ui.add_space(10.0);
     ui.separator();
-    ui.add_space(6.0);
+    ui.add_space(10.0);
+
+    // ---- 两个操作，到此为止 ----
     ui.horizontal(|ui| {
-        if ui.add(button_ghost(format!("删除这份副本（{}）", branch).leak())).clicked() {
+        // 覆盖：用这份副本整份替换当前数据（覆盖后照常入队同步）
+        let can_apply = !added.is_empty() || !changed.is_empty();
+        if ui
+            .add_enabled(
+                can_apply,
+                button_primary(if can_apply { "用副本覆盖当前" } else { "副本与当前一致" }),
+            )
+            .clicked()
+        {
+            app.apply_conflict_overwrite();
+            return;
+        }
+        if ui.add(button_ghost("删除副本")).clicked() {
             app.delete_conflict(branch.to_string());
         }
     });
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new("「用副本覆盖当前」会把当前数据整份替换为副本内容并自动同步；\n「删除副本」保留当前数据不变。")
+            .size(11.0)
+            .color(theme::TEXT_WEAK),
+    );
 }
 
 // ============================== 设置对话框 ==============================
@@ -6704,6 +6681,9 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
 
 
 

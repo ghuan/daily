@@ -3235,6 +3235,8 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                         );
                     });
                 // 冲突副本入口：有副本时醒目（琥珀色），没有时弱化（仅 Git 模式显示）
+                // （bottom_up 布局：这里的 space 落在冲突副本按钮与上方同步状态块之间）
+                ui.add_space(4.0);
                 if app.settings.kind == Kind::Git {
                     let count = app
                         .conflict_branches
@@ -3271,7 +3273,6 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                         app.open_conflicts();
                     }
                 }
-                ui.add_space(4.0);
                 if ui
                     .add(
                         egui::Button::new(

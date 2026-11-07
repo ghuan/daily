@@ -1080,6 +1080,9 @@ struct PlanApp {
     ym_picker_open: bool,
     /// 当前展开的是年份面板还是月份面板（"year" / "month"）。
     ym_picker_mode: Option<String>,
+    /// 年月面板浮层的屏幕矩形（show_ym_panel 每帧回填）。
+    /// 外点判定用它把「面板内部」排除在外。
+    ym_panel_rect: Option<egui::Rect>,
     show_settings: bool,
     /// 设置对话框里的临时编辑值。
     cfg_kind: Kind,
@@ -1235,6 +1238,7 @@ impl PlanApp {
             day_popup: None,
             ym_picker_open: false,
             ym_picker_mode: None,
+            ym_panel_rect: None,
             day_popup_rect: None,
             show_settings: false,
             cfg_error: None,
@@ -2442,13 +2446,6 @@ fn date_picker(
 /// 弹层用 `Area + Foreground`，点外面或 Esc 收起（与日期选择器同款交互）。
 fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) {
     let mut open = app.ym_picker_open;
-    eprintln!(
-        "[ym] run: open={} pressed={} pos={:?} mode={:?}",
-        open,
-        ui.input(|i| i.pointer.primary_pressed()),
-        ui.input(|i| i.pointer.interact_pos()),
-        app.ym_picker_mode
-    );
 
     // 两个可点的文字按钮：年份、月份（真实 Button，交互路径与月历格子一致）
     let year_active = open && app.ym_picker_mode.as_deref() == Some("year");
@@ -2496,36 +2493,7 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
 
     if open {
         let mode = app.ym_picker_mode.clone().unwrap_or_else(|| "month".into());
-        // 面板矩形（面板 + 触发按钮都算面板的一部分）
-        let panel_rect = if mode == "year" {
-            year_btn.rect
-        } else {
-            month_btn.rect
-        };
-
-        // ★「点外面关闭」的输入级实现：主键**按下**的那一帧（不等松开），
-        // 指针位置不在面板 rect 内 → 立即收起。用全局输入（primary_pressed
-        // + interact_pos），完全不依赖 egui 的 hit-test —— 此前的 Area 拦截层
-        // 方案被其它持久化浮层的死 widget 抢走点击（实测），输入级判定没有这个坑。
-        // 注意：打开动作本身的点击在面板 rect 内（点的是年/月按钮），天然不会误关。
-        let released_outside = ui.input(|i| {
-            if !i.pointer.primary_pressed() {
-                return false;
-            }
-            let Some(pos) = i.pointer.interact_pos() else {
-                return false;
-            };
-            !panel_rect.contains(pos)
-        });
-        if released_outside {
-            open = false; // 只改本地，写回统一在函数尾部
-        }
-        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            open = false;
-        }
-        // 面板本体。content 闭包可变借用 app；show_ym_panel 内的关闭按钮
-        // 直接置 app.ym_picker_open=false（若在闭包外写会借用冲突），
-        // 因此关闭按钮回调里直接改全局标志即可，与本地 open 的写回无冲突。
+        // 画面板（show_ym_panel 会把浮层矩形回填到 app.ym_panel_rect）
         let (id, anchor_rect) = if mode == "year" {
             (egui::Id::new("ym_picker_popup").with("y"), year_btn.rect)
         } else {
@@ -2538,6 +2506,38 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
                 ym_month_grid(app, ui, selected);
             }
         });
+
+        // ★「点外面关闭」：本帧发生主键按下，且按下位置**不在任何面板区域**——
+        // 面板区域 = 触发按钮 rect ∪ 浮层 rect（上一帧回填）。
+        // 之前只拿按钮小条当面板，点浮层内部也会被判成「外面」立即收起，
+        // 表现为面板乱关。两块 rect 合并后判定才正确。
+        let pressed_outside = ui.input(|i| {
+            if !i.pointer.primary_pressed() {
+                return false;
+            }
+            let Some(pos) = i.pointer.interact_pos() else {
+                return false;
+            };
+            if year_btn.rect.contains(pos) || month_btn.rect.contains(pos) {
+                return false;
+            }
+            // 浮层 rect 是上一帧的：位置落在里面就不算外面
+            if let Some(r) = app.ym_panel_rect {
+                if r.contains(pos) {
+                    return false;
+                }
+            }
+            true
+        });
+        if pressed_outside {
+            open = false; // 只改本地，写回统一在函数尾部
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            open = false;
+        }
+    } else {
+        // 面板已收起：清掉缓存的浮层矩形
+        app.ym_panel_rect = None;
     }
     // ★ 把本地状态写回：点按钮 → open=true 必须存进 app，下一帧才知道面板开着。
     //   （此前漏了这一步，面板「开一帧、灭一帧」，表现为点击毫无反应。）
@@ -2546,8 +2546,8 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
 
 /// 年月选择浮层的容器：定位在触发按钮下方，卡片样式。
 ///
-/// 返回浮层矩形；并保证面板在拦截层（`ym_picker_intercept`）之上：
-/// 用 `Order::Tooltip`（高于 Foreground）+ `move_to_top` 钉住。
+/// 每帧把浮层的屏幕矩形回填到 `app.ym_panel_rect`——
+/// 外点判定用它区分「点在面板内（不关）」和「点在面板外（收起）」。
 fn show_ym_panel(
     app: &mut PlanApp,
     ui: &mut egui::Ui,
@@ -2579,6 +2579,7 @@ fn show_ym_panel(
                     content(app, ui);
                 });
         });
+    app.ym_panel_rect = Some(area.response.rect);
     area.response.rect
 }
 
@@ -5712,6 +5713,7 @@ mod workflow_tests {
             day_popup: None,
             ym_picker_open: false,
             ym_picker_mode: None,
+            ym_panel_rect: None,
             day_popup_rect: None,
             show_settings: false,
             cfg_kind: Kind::Local,
@@ -6974,6 +6976,7 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
 
 
 

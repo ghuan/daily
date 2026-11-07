@@ -2442,6 +2442,13 @@ fn date_picker(
 /// 弹层用 `Area + Foreground`，点外面或 Esc 收起（与日期选择器同款交互）。
 fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) {
     let mut open = app.ym_picker_open;
+    eprintln!(
+        "[ym] run: open={} pressed={} pos={:?} mode={:?}",
+        open,
+        ui.input(|i| i.pointer.primary_pressed()),
+        ui.input(|i| i.pointer.interact_pos()),
+        app.ym_picker_mode
+    );
 
     // 两个可点的文字按钮：年份、月份（真实 Button，交互路径与月历格子一致）
     let year_active = open && app.ym_picker_mode.as_deref() == Some("year");
@@ -2511,21 +2518,26 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
             !panel_rect.contains(pos)
         });
         if released_outside {
-            app.ym_picker_open = false;
+            open = false; // 只改本地，写回统一在函数尾部
         }
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
-            app.ym_picker_open = false;
+            open = false;
         }
-        // 面板本体
-        if mode == "year" {
-            show_ym_panel(ui, egui::Id::new("ym_picker_popup").with("y"), panel_rect, |ui| {
-                ym_year_grid(app, ui, selected);
-            });
+        // 面板本体。content 闭包可变借用 app；show_ym_panel 内的关闭按钮
+        // 直接置 app.ym_picker_open=false（若在闭包外写会借用冲突），
+        // 因此关闭按钮回调里直接改全局标志即可，与本地 open 的写回无冲突。
+        let (id, anchor_rect) = if mode == "year" {
+            (egui::Id::new("ym_picker_popup").with("y"), year_btn.rect)
         } else {
-            show_ym_panel(ui, egui::Id::new("ym_picker_popup").with("m"), panel_rect, |ui| {
+            (egui::Id::new("ym_picker_popup").with("m"), month_btn.rect)
+        };
+        show_ym_panel(app, ui, id, anchor_rect, |app, ui| {
+            if mode == "year" {
+                ym_year_grid(app, ui, selected);
+            } else {
                 ym_month_grid(app, ui, selected);
-            });
-        }
+            }
+        });
     }
     // ★ 把本地状态写回：点按钮 → open=true 必须存进 app，下一帧才知道面板开着。
     //   （此前漏了这一步，面板「开一帧、灭一帧」，表现为点击毫无反应。）
@@ -2537,10 +2549,11 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
 /// 返回浮层矩形；并保证面板在拦截层（`ym_picker_intercept`）之上：
 /// 用 `Order::Tooltip`（高于 Foreground）+ `move_to_top` 钉住。
 fn show_ym_panel(
+    app: &mut PlanApp,
     ui: &mut egui::Ui,
     id: egui::Id,
     anchor_rect: egui::Rect,
-    content: impl FnOnce(&mut egui::Ui),
+    content: impl FnOnce(&mut PlanApp, &mut egui::Ui),
 ) -> egui::Rect {
     let anchor = anchor_rect.left_bottom() + egui::vec2(0.0, 4.0);
     let area = egui::Area::new(id)
@@ -2555,7 +2568,15 @@ fn show_ym_panel(
                 .inner_margin(egui::Margin::same(12))
                 .show(ui, |ui| {
                     ui.set_width(300.0);
-                    content(ui);
+                    // 面板右上角常驻关闭按钮：无论外点判定在什么环境下是否
+                    // 生效，用户始终有可见可靠的关闭途径。
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(button_mini("✕ 关闭")).clicked() {
+                            app.ym_picker_open = false;
+                        }
+                    });
+                    ui.add_space(2.0);
+                    content(app, ui);
                 });
         });
     area.response.rect
@@ -6953,6 +6974,10 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
+
 
 
 

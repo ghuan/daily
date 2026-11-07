@@ -3139,7 +3139,7 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                         app.open_conflicts();
                     }
                 }
-                ui.add_space(8.0);
+                ui.add_space(4.0);
                 if ui
                     .add(
                         egui::Button::new(
@@ -4253,12 +4253,15 @@ fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                 })
                 .collect();
 
-            ui.horizontal(|ui| {
-                stat_card(ui, "记录总数", &total.to_string(), theme::ACCENT);
-                stat_card(ui, "已完成", &done.to_string(), theme::OK);
-                stat_card(ui, "未完成", &undone.to_string(), theme::WARN);
-            });
-            ui.add_space(12.0);
+            ui.label(
+                RichText::new(format!(
+                    "共 {} 条 ｜ 已完成 {} ｜ 未完成 {}",
+                    total, done, undone
+                ))
+                .size(12.0)
+                .color(theme::TEXT_WEAK),
+            );
+            ui.add_space(8.0);
 
             // ---- 过滤 ----
             ui.horizontal(|ui| {
@@ -4386,20 +4389,6 @@ fn stats_range(scope: StatsScope, anchor: NaiveDate) -> (NaiveDate, NaiveDate) {
     }
 }
 
-/// 统计页顶部的一张汇总卡。
-fn stat_card(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
-    egui::Frame::NONE
-        .fill(theme::CARD)
-        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
-        .corner_radius(egui::CornerRadius::same(10))
-        .inner_margin(egui::Margin::symmetric(18, 12))
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.label(RichText::new(value).size(22.0).strong().color(color));
-                ui.label(RichText::new(label).size(11.0).color(theme::TEXT_WEAK));
-            });
-        });
-}
 fn template_card(
     ui: &mut egui::Ui,
     t: &Plan,
@@ -4491,7 +4480,7 @@ fn nav_item(ui: &mut egui::Ui, icon: &str, text: &str, active: bool) -> egui::Re
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(icon).size(14.0).color(fg));
+                ui.label(RichText::new(icon).size(13.0).color(fg));
                 ui.add_space(4.0);
                 ui.label(RichText::new(text).size(13.0).strong().color(fg));
             });
@@ -7276,6 +7265,9 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
 
 
 

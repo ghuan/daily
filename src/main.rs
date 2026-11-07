@@ -622,12 +622,13 @@ impl Backend {
     }
 }
 
-/// 根据设置构建后端。数据源恒为本地文件；Git 只作为可选的同步通道挂上去。
+/// 根据设置构建后端。数据源恒为本地数据目录；Git 只是同一目录上的同步通道
+/// （数据目录本身就是 git 工作副本，见 `store::GitStore`）。
 fn build_backend(settings: &Settings) -> Backend {
     let dir = store::app_dir();
     let local = DocStore::new(dir.join(store::DOC_DIR_NAME));
     let git = if git_ready(settings) {
-        Some(GitStore::new(dir.join("repo"), settings.git.clone()))
+        Some(GitStore::new(dir.join(store::DOC_DIR_NAME), settings.git.clone()))
     } else {
         None
     };
@@ -1155,20 +1156,23 @@ impl PlanApp {
 
         let startup_pull = git_ready(&settings);
         // 启动拉取（Git 模式）放后台：网络交互不该挡住首帧。
-        // 拉到远端内容后写回本地数据目录，再经 "startup-pull" 重新读盘刷新界面。
+        // 数据目录本身就是 git 工作副本，拉取 = fetch + reset --hard 直接作用在数据上。
+        // 拉到后经 "startup-pull" 重新读盘刷新界面。
         if startup_pull {
             let tx = sync_tx.clone();
             let cfg = settings.git.clone();
             let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
             std::thread::spawn(move || {
-                let git = GitStore::new(store::app_dir().join("repo"), cfg);
+                let git = GitStore::new(local_dir, cfg);
                 let res = git
-                    .fetch_remote_dir()
-                    .and_then(|maybe| match maybe {
-                        Some(remote) => store::replace_dir_contents(&remote, &local_dir),
-                        None => Ok(()),
+                    .pull()
+                    .map(|pulled| {
+                        if pulled {
+                            "已从 Git 拉取最新".to_string()
+                        } else {
+                            String::new() // 远端还没有数据，静默
+                        }
                     })
-                    .map(|()| "已从 Git 拉取最新".to_string())
                     .map_err(|e| e.to_string());
                 let _ = tx.send(SyncMsg::Finished("startup-pull", res));
             });
@@ -1285,9 +1289,9 @@ impl PlanApp {
         let tx = self.sync_tx.clone();
         let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
         std::thread::spawn(move || {
-            let git = GitStore::new(store::app_dir().join("repo"), settings.git.clone());
+            let git = GitStore::new(local_dir, settings.git.clone());
             let res = git
-                .sync_round(&local_dir, &reason)
+                .sync_round(&reason)
                 .map(|outcome| match outcome {
                     store::SyncOutcome::Pushed => "已推送到 Git".to_string(),
                     store::SyncOutcome::Pulled => "已从 Git 拉取最新".to_string(),
@@ -1319,16 +1323,10 @@ impl PlanApp {
         let tx = self.sync_tx.clone();
         let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
         std::thread::spawn(move || {
-            let git = GitStore::new(store::app_dir().join("repo"), settings.git.clone());
+            let git = GitStore::new(local_dir, settings.git.clone());
             let res = git
-                .fetch_remote_dir()
-                .and_then(|maybe| match maybe {
-                    Some(remote_dir) => {
-                        store::replace_dir_contents(&remote_dir, &local_dir)?;
-                        Ok("已采用远端数据（本机未推送改动已丢弃）".to_string())
-                    }
-                    None => Ok("远端没有数据".to_string()),
-                })
+                .pull()
+                .map(|_| "已采用远端数据（本机未推送改动已丢弃）".to_string())
                 .map_err(|e| e.to_string());
             let _ = tx.send(SyncMsg::Finished("pull", res));
         });
@@ -1344,9 +1342,9 @@ impl PlanApp {
         let tx = self.sync_tx.clone();
         let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
         std::thread::spawn(move || {
-            let git = GitStore::new(store::app_dir().join("repo"), settings.git.clone());
+            let git = GitStore::new(local_dir, settings.git.clone());
             let res = git
-                .push_dir(&local_dir, "解决冲突：保留本机改动")
+                .push("解决冲突：保留本机改动")
                 .map(|_| "已推送本机数据（远端内容被覆盖，历史可回溯）".to_string())
                 .map_err(|e| e.to_string());
             let _ = tx.send(SyncMsg::Finished("push", res));
@@ -1360,21 +1358,11 @@ impl PlanApp {
                     self.syncing = false;
                     match res {
                         Ok(text) => {
-                            self.set_status(text.clone(), true);
-                            // 「sync」回报 Pulled：中转副本里是远端内容，写回本地再读盘
-                            if what == "sync" && text.contains("拉取") {
-                                let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
-                                if let Ok(Some(remote_dir)) = (|| {
-                                    let git = GitStore::new(
-                                        store::app_dir().join("repo"),
-                                        self.settings.git.clone(),
-                                    );
-                                    git.fetch_remote_dir()
-                                })() {
-                                    let _ = store::replace_dir_contents(&remote_dir, &local_dir);
-                                }
+                            if !text.is_empty() {
+                                self.set_status(text, true);
                             }
-                            // 重新读盘（手动「立即同步」、启动拉取、延迟同步都要）
+                            // 重新读盘（sync_round 拉取、手动「立即同步」、启动拉取都要；
+                            // 新模型下数据目录本身就是 git 工作副本，pull 已直接落到数据上）
                             if matches!(what, "pull" | "startup-pull" | "sync") {
                                 let backend = build_backend(&self.settings);
                                 if let Ok(doc) = backend.load() {
@@ -5862,12 +5850,11 @@ impl PlanApp {
         self.cfg_msg = Some("设置已保存".into());
 
         if kind_changed || git_changed {
-            // 改了仓库配置，或刚启用 Git：后台拉一次远端，把结果写回本地数据文件。
-            // 拉取要走网络（clone/fetch），**绝不能放在 UI 线程**，否则点「保存设置」
-            // 整个窗口会无响应几秒到几十秒。这里丢给后台线程，结果经 poll_sync 回填。
+            // 改了仓库配置，或刚启用 Git：把数据目录接上新远端并拉一次。
+            // prepare 会 git init / 校正 remote / fetch / 把远端内容铺进数据目录；
+            // 网络交互**绝不能放在 UI 线程**，丢给后台线程，结果经 poll_sync 回填。
             //
-            // 注意方向：**远端 → 本地**。本地 `plans.json` 是唯一数据源，只有远端确实
-            // 有数据时才覆盖它（见 Switched 分支）。
+            // 注意方向：**远端 → 本地**。远端确实有数据时才覆盖本地（见 Switched 分支）。
             if self.settings.kind == Kind::Git {
                 if !store::git_available() {
                     self.cfg_error = Some("未检测到 git 命令，无法使用 Git 同步".into());
@@ -5879,17 +5866,10 @@ impl PlanApp {
                 let tx = self.sync_tx.clone();
                 let local_dir = store::app_dir().join(store::DOC_DIR_NAME);
                 std::thread::spawn(move || {
-                    let git = GitStore::new(store::app_dir().join("repo"), settings.git.clone());
-                    // Ok(true) = 远端有数据并已写回本地；Ok(false) = 远端还没有数据
+                    let git = GitStore::new(local_dir, settings.git.clone());
+                    // Ok(true) = 远端有数据并已铺进本地；Ok(false) = 远端还没有数据
                     let res = git
-                        .fetch_remote_dir()
-                        .and_then(|maybe| match maybe {
-                            Some(remote) => {
-                                store::replace_dir_contents(&remote, &local_dir)?;
-                                Ok(true)
-                            }
-                            None => Ok(false),
-                        })
+                        .pull()
                         .map_err(|e| e.to_string());
                     let _ = tx.send(SyncMsg::Switched(res));
                 });

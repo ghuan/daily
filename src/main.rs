@@ -759,10 +759,14 @@ struct EditState {
     year_day: u32,
     /// 日期选择器浮层是否展开。
     date_open: bool,
+    /// 日期选择器浮层的屏幕矩形（供「点弹窗外关闭」排除）。
+    date_popup_rect: Option<egui::Rect>,
     /// 日期选择器当前翻到的月份（与选中日期解耦，翻月不会改选中值）。
     cal_month: NaiveDate,
     /// 时间选择器浮层是否展开。
     time_open: bool,
+    /// 时间选择器浮层的屏幕矩形（供「点弹窗外关闭」排除）。
+    time_popup_rect: Option<egui::Rect>,
     error: Option<String>,
 }
 
@@ -789,8 +793,10 @@ impl EditState {
             year_month: today.month(),
             year_day: today.day(),
             date_open: false,
+            date_popup_rect: None,
             cal_month: today,
             time_open: false,
+            time_popup_rect: None,
             error: None,
         }
     }
@@ -853,8 +859,10 @@ impl EditState {
             year_month,
             year_day,
             date_open: false,
+            date_popup_rect: None,
             cal_month: today,
             time_open: false,
+            time_popup_rect: None,
             error: None,
         }
     }
@@ -2136,6 +2144,30 @@ impl eframe::App for PlanApp {
 
 // ============================== 通用小控件 ==============================
 
+/// 判断本帧的「点击」是否落在指定窗口矩形**之外**（用于点弹窗外关闭）。
+///
+/// `extra_rects`：额外不算「外面」的区域——弹窗内部挂的浮层（日期选择器、
+/// 时间选择器等独立 Area）的矩形。点在浮层上不应关闭弹窗。
+///
+/// egui 的 Window 不自带外点关闭，各对话框在 show 之后统一调用本函数。
+fn clicked_outside_window(ctx: &egui::Context, window_rect: egui::Rect, extra_rects: &[egui::Rect]) -> bool {
+    ctx.input(|i| {
+        if !i.pointer.any_click() {
+            return false;
+        }
+        let Some(pos) = i.pointer.interact_pos() else {
+            return false;
+        };
+        if window_rect.contains(pos) {
+            return false;
+        }
+        if extra_rects.iter().any(|r| r.contains(pos)) {
+            return false;
+        }
+        true
+    })
+}
+
 /// 主按钮（强调色）。
 fn button_primary(text: &str) -> egui::Button<'static> {
     egui::Button::new(
@@ -2284,11 +2316,14 @@ fn text_input_multiline(ui: &mut egui::Ui, text: &mut String, rows: usize) -> eg
 // ============================== 日期 / 时间选择器 ==============================
 
 /// 日期选择器的触发按钮：显示当前日期，点击展开月历浮层。
+///
+/// `popup_rect_out`：浮层展开时回填它的屏幕矩形（供「点弹窗外关闭」排除浮层区域）。
 fn date_picker(
     ui: &mut egui::Ui,
     date: &mut NaiveDate,
     open: &mut bool,
     cal_month: &mut NaiveDate,
+    popup_rect_out: &mut Option<egui::Rect>,
 ) -> egui::Response {
     let today = Local::now().date_naive();
     // 整块都可点：图标、文字、箭头任何位置点下去都能展开，
@@ -2352,6 +2387,8 @@ fn date_picker(
                         month_grid(ui, date, cal_month, today, open);
                     });
             });
+        // 浮层矩形回填给调用方（编辑对话框的「点外面关闭」用它排除浮层区域）
+        *popup_rect_out = Some(area.response.rect);
         // 点浮层和按钮之外 → 收起。
         if ui.input(|i| i.pointer.any_click()) {
             if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
@@ -2363,6 +2400,8 @@ fn date_picker(
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             *open = false;
         }
+    } else {
+        *popup_rect_out = None;
     }
     resp
 }
@@ -2668,7 +2707,13 @@ fn month_grid(
 }
 
 /// 时间选择器：显示 HH:MM，点击展开「时 + 分」两列快选。
-fn time_picker(ui: &mut egui::Ui, hour: &mut u32, minute: &mut u32, open: &mut bool) -> egui::Response {
+fn time_picker(
+    ui: &mut egui::Ui,
+    hour: &mut u32,
+    minute: &mut u32,
+    open: &mut bool,
+    popup_rect_out: &mut Option<egui::Rect>,
+) -> egui::Response {
     // 整块都可点，理由同 date_picker。
     let inner = egui::Frame::NONE
         .fill(Color32::from_rgb(248, 249, 252))
@@ -2818,6 +2863,8 @@ fn time_picker(ui: &mut egui::Ui, hour: &mut u32, minute: &mut u32, open: &mut b
                         });
                     });
             });
+        // 浮层矩形回填给调用方（编辑对话框的「点外面关闭」用它排除浮层区域）
+        *popup_rect_out = Some(area.response.rect);
         if ui.input(|i| i.pointer.any_click()) {
             if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
                 if !area.response.rect.contains(p) && !rect.contains(p) {
@@ -2828,6 +2875,8 @@ fn time_picker(ui: &mut egui::Ui, hour: &mut u32, minute: &mut u32, open: &mut b
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             *open = false;
         }
+    } else {
+        *popup_rect_out = None;
     }
     resp
 }
@@ -4306,7 +4355,7 @@ fn ui_record_view_dialog(app: &mut PlanApp, ctx: &egui::Context) {
     let mut open = true;
     let mut close = false;
     let mut edit = false;
-    egui::Window::new("查看记录")
+    let window = egui::Window::new("查看记录")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -4419,10 +4468,14 @@ fn ui_record_view_dialog(app: &mut PlanApp, ctx: &egui::Context) {
                 }
             });
         });
+    let outside = window
+        .as_ref()
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &[]))
+        .unwrap_or(false);
     if edit {
         app.view_record = None;
         app.open_edit_record(r.id);
-    } else if close || !open {
+    } else if close || !open || outside {
         app.view_record = None;
     }
 }
@@ -4436,7 +4489,7 @@ fn ui_delete_template_dialog(app: &mut PlanApp, ctx: &egui::Context) {
     let mut confirm = false;
     let mut cancel = false;
 
-    egui::Window::new("删除提醒模板")
+    let window = egui::Window::new("删除提醒模板")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -4536,11 +4589,15 @@ fn ui_delete_template_dialog(app: &mut PlanApp, ctx: &egui::Context) {
             });
         });
 
+    let outside = window
+        .as_ref()
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &[]))
+        .unwrap_or(false);
     if confirm {
         let (id, remove) = (prompt.template_id, prompt.remove_records);
         app.delete_prompt = None;
         app.delete_template(id, remove);
-    } else if cancel || !open {
+    } else if cancel || !open || outside {
         app.delete_prompt = None;
     }
 }
@@ -4565,7 +4622,7 @@ fn ui_record_delete_dialog(app: &mut PlanApp, ctx: &egui::Context) {
         model::fmt_time(prompt.time)
     );
 
-    egui::Window::new("确认删除记录")
+    let window = egui::Window::new("确认删除记录")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -4643,10 +4700,14 @@ fn ui_record_delete_dialog(app: &mut PlanApp, ctx: &egui::Context) {
             });
         });
 
+    let outside = window
+        .as_ref()
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &[]))
+        .unwrap_or(false);
     if confirm {
         app.record_delete_prompt = None;
         app.cancel_record(record_id);
-    } else if cancel || !open {
+    } else if cancel || !open || outside {
         app.record_delete_prompt = None;
     }
 }
@@ -4896,7 +4957,7 @@ fn ui_edit_dialog(app: &mut PlanApp, ctx: &egui::Context) {
     let mut dropped_tag: Option<String> = None;
     let state = app.edit.as_mut().unwrap();
 
-    egui::Window::new("计划与提醒")
+    let window = egui::Window::new("计划与提醒")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -4996,6 +5057,7 @@ fn ui_edit_dialog(app: &mut PlanApp, ctx: &egui::Context) {
                             &mut state.date,
                             &mut state.date_open,
                             &mut state.cal_month,
+                            &mut state.date_popup_rect,
                         );
                     });
                     ui.add_space(12.0);
@@ -5006,6 +5068,7 @@ fn ui_edit_dialog(app: &mut PlanApp, ctx: &egui::Context) {
                             &mut state.hour,
                             &mut state.minute,
                             &mut state.time_open,
+                            &mut state.time_popup_rect,
                         );
                     });
                 });
@@ -5017,6 +5080,7 @@ fn ui_edit_dialog(app: &mut PlanApp, ctx: &egui::Context) {
                     &mut state.hour,
                     &mut state.minute,
                     &mut state.time_open,
+                    &mut state.time_popup_rect,
                 );
             }
             if let Some(hint) = time_hint {
@@ -5337,9 +5401,39 @@ fn ui_edit_dialog(app: &mut PlanApp, ctx: &egui::Context) {
         app.save_and_sync("删除标签");
     }
 
+    // 点弹窗外面关闭；日期/时间选择器浮层展开时不算「外面」。
+    let mut extra = Vec::new();
+    if let Some(state) = &app.edit {
+        if state.date_open {
+            if let Some(r) = state.date_popup_rect {
+                extra.push(r);
+            }
+        }
+        if state.time_open {
+            if let Some(r) = state.time_popup_rect {
+                extra.push(r);
+            }
+        }
+    }
+    let outside = window
+        .as_ref()
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &extra))
+        .unwrap_or(false);
+    // 有浮层展开时先收浮层，不关弹窗（符合直觉：第一次点外面收浮层，第二次关弹窗）
+    let picker_open = app
+        .edit
+        .as_ref()
+        .map(|s| s.date_open || s.time_open)
+        .unwrap_or(false);
+
     if save {
         app.save_edit();
-    } else if !open || cancel {
+    } else if outside && picker_open {
+        if let Some(state) = &mut app.edit {
+            state.date_open = false;
+            state.time_open = false;
+        }
+    } else if !open || cancel || outside {
         app.edit = None;
     }
 }
@@ -5896,7 +5990,7 @@ fn ui_conflicts_dialog(app: &mut PlanApp, ctx: &egui::Context) {
         return;
     }
     let mut open = true;
-    egui::Window::new("冲突副本")
+    let window = egui::Window::new("冲突副本")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -5999,7 +6093,11 @@ fn ui_conflicts_dialog(app: &mut PlanApp, ctx: &egui::Context) {
                 }
             }
         });
-    if !open {
+    let outside = window
+        .as_ref()
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &[]))
+        .unwrap_or(false);
+    if !open || outside {
         app.show_conflicts = false;
     }
 }
@@ -6170,7 +6268,7 @@ fn ui_settings(app: &mut PlanApp, ctx: &egui::Context) {
     let mut close = false;
     let mut apply = false;
 
-    egui::Window::new("设置")
+    let window = egui::Window::new("设置")
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -6333,10 +6431,14 @@ fn ui_settings(app: &mut PlanApp, ctx: &egui::Context) {
             }
         });
 
+    let outside = window
+        .as_ref()
+        .map(|w| clicked_outside_window(ctx, w.response.rect, &[]))
+        .unwrap_or(false);
     if apply {
         app.apply_settings();
     }
-    if close || !open {
+    if close || !open || outside {
         app.show_settings = false;
     }
 }
@@ -6809,6 +6911,9 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
 
 
 

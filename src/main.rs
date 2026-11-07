@@ -3036,20 +3036,8 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                 app.page = WorkspacePage::Calendar;
             }
             ui.add_space(4.0);
-            if nav_item(ui, "⟳", "提醒模板", app.page == WorkspacePage::Templates).clicked() {
-                app.page = WorkspacePage::Templates;
-            }
-            ui.add_space(4.0);
-            if nav_item(ui, "＋", "新建模板", false).clicked() {
-                app.open_edit_state(EditState::new_template());
-            }
-            ui.add_space(4.0);
-            if nav_item(ui, "📊", "统计", app.page == WorkspacePage::Stats).clicked() {
+            if nav_item(ui, "📊", "统计列表", app.page == WorkspacePage::Stats).clicked() {
                 app.page = WorkspacePage::Stats;
-            }
-            ui.add_space(4.0);
-            if nav_item(ui, "⚙", "设置", false).clicked() {
-                open_settings(app);
             }
 
             ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {

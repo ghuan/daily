@@ -5876,7 +5876,8 @@ fn ui_conflicts_dialog(app: &mut PlanApp, ctx: &egui::Context) {
                                                 .size(12.5)
                                                 .color(theme::TEXT),
                                         )
-                                        .fill(theme::SIDEBAR_HOVER)
+                                        .fill(theme::BG)
+                                        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
                                         .corner_radius(egui::CornerRadius::same(8))
                                         .min_size(egui::vec2(320.0, 34.0)),
                                     )

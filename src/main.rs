@@ -3692,7 +3692,7 @@ fn ui_month_grid(app: &mut PlanApp, ui: &mut egui::Ui, today: NaiveDate) {
         if in_month && !data.entries.is_empty() {
             let clip = cell.shrink2(egui::vec2(6.0, 4.0));
             let cp = painter.with_clip_rect(clip);
-            let mut y = cell.top() + 30.0;
+            let mut y = cell.top() + 26.0;
             for (title, done) in data.entries.iter().take(3) {
                 let color = if *done { theme::TEXT_WEAK } else { theme::TEXT };
                 cp.text(
@@ -7390,6 +7390,7 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
 
 
 

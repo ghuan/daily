@@ -625,6 +625,83 @@ impl GitStore {
         }
     }
 
+    // ==================== 冲突副本管理 ====================
+
+    /// 列出所有冲突副本分支（`conflict/<时间戳>`），按时间倒序。
+    ///
+    /// 返回 `(分支名, 提交时间, 提交说明)`。时间取自提交的 committer date
+    /// （创建副本的时刻），说明即「冲突副本：本机改动（原准备：…）」。
+    pub fn list_conflict_branches(&self) -> Result<Vec<(String, String, String)>> {
+        if !self.dir.join(".git").is_dir() {
+            return Ok(Vec::new());
+        }
+        // % (objectname) 不需要；refname + committerdate + subject
+        let out = match self.run(&[
+            "for-each-ref",
+            "refs/heads/conflict/*",
+            "--sort=-committerdate",
+            "--format=%(refname:short)%09%(committerdate:local)%09%(contents:subject)",
+        ]) {
+            Ok(s) => s,
+            Err(_) => return Ok(Vec::new()), // 没有任何匹配时 git 也返回成功+空串，这里兜底
+        };
+        let mut list = Vec::new();
+        for line in out.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut parts = line.splitn(3, '\t');
+            if let (Some(name), Some(time), Some(subject)) = (parts.next(), parts.next(), parts.next()) {
+                list.push((name.trim().to_string(), time.trim().to_string(), subject.trim().to_string()));
+            }
+        }
+        Ok(list)
+    }
+
+    /// 读取某份冲突副本的完整数据。
+    ///
+    /// 把分支上的 `data.json` + `NNNN.json` 拼回一个 `Doc`——副本就是冲突
+    /// 时刻本机数据目录的快照，结构与主数据完全一致，可以直接复用解析。
+    pub fn load_conflict_doc(&self, branch: &str) -> Result<Doc> {
+        if !branch.starts_with("conflict/") {
+            bail!("只允许读取 conflict/ 分支");
+        }
+        // data.json（索引：模板/标签）
+        let index_text = self.run(&["show", &format!("{}:{}", branch, DOC_INDEX_FILE)])?;
+        // 年份文件：从索引里的 years 字段拿清单（保存时写入），缺失就跳过
+        #[derive(Deserialize)]
+        struct YearsProbe {
+            #[serde(default)]
+            years: Vec<i32>,
+        }
+        let years: Vec<i32> = serde_json::from_str::<YearsProbe>(&index_text)
+            .map(|p| p.years)
+            .unwrap_or_default();
+        let mut year_texts = Vec::new();
+        for y in years {
+            if let Ok(text) = self.run(&["show", &format!("{}:{}.json", branch, y)]) {
+                year_texts.push(text);
+            }
+        }
+        Doc::from_year_parts(&index_text, &year_texts)
+            .map(|d| d.normalized())
+            .with_context(|| format!("解析冲突副本失败：{}", branch))
+    }
+
+    /// 删除一份冲突副本（本地 + 远端）。
+    ///
+    /// 本地分支强制删除（-D，因为副本分支从不在主分支历史里）；远端同名
+    /// 分支也一并删除。远端删除失败不阻断——本地已删，下次 push 不会再带它，
+    /// 仅远端残留一个孤儿分支，无害。
+    pub fn delete_conflict_branch(&self, branch: &str) -> Result<()> {
+        if !branch.starts_with("conflict/") {
+            bail!("只允许删除 conflict/ 分支");
+        }
+        self.run(&["branch", "-D", branch])?;
+        let _ = self.run(&["push", "origin", "--delete", branch]);
+        Ok(())
+    }
+
     fn run(&self, args: &[&str]) -> Result<String> {
         self.run_in(&self.dir, args)
     }
@@ -1200,6 +1277,18 @@ mod tests {
         // ③ 当前在主分支上
         let cur = git.run(&["branch", "--show-current"]).unwrap();
         assert_eq!(cur.trim(), "main");
+
+        // ④ 副本管理 API：list → load → delete 全链路
+        let list = git.list_conflict_branches().unwrap();
+        assert_eq!(list.len(), 1, "应列出 1 份副本：{:?}", list);
+        let (name, _, subject) = &list[0];
+        assert!(name.starts_with("conflict/"));
+        assert!(subject.contains("冲突副本"), "提交说明应可读：{}", subject);
+        let cdoc = git.load_conflict_doc(name).unwrap();
+        assert!(cdoc.records.iter().any(|r| r.title == "本机改动"), "副本 Doc 应含本机改动");
+        git.delete_conflict_branch(name).unwrap();
+        assert!(git.list_conflict_branches().unwrap().is_empty(), "删除后列表应为空");
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -1064,6 +1064,10 @@ struct PlanApp {
     day_popup: Option<NaiveDate>,
     /// 上一帧「当天记录」窗口的位置，用来判断「点了窗口外面就关掉」。
     day_popup_rect: Option<egui::Rect>,
+    /// 日历视图的「年月选择」浮层是否展开。
+    ym_picker_open: bool,
+    /// 当前展开的是年份面板还是月份面板（"year" / "month"）。
+    ym_picker_mode: Option<String>,
     show_settings: bool,
     /// 设置对话框里的临时编辑值。
     cfg_kind: Kind,
@@ -1214,6 +1218,8 @@ impl PlanApp {
             delete_prompt: None,
             record_delete_prompt: None,
             day_popup: None,
+            ym_picker_open: false,
+            ym_picker_mode: None,
             day_popup_rect: None,
             show_settings: false,
             cfg_error: None,
@@ -2361,6 +2367,216 @@ fn date_picker(
     resp
 }
 
+/// 日历视图的「年 / 月」快捷选择控件。
+///
+/// 「2026 年」和「11 月」各自是一个可点击的文字按钮：点年份弹出年份网格
+/// （±12 年），点月份弹出 12 宫格。选完直接跳，不用一格一格翻。
+/// 弹层用 `Area + Foreground`，点外面或 Esc 收起（与日期选择器同款交互）。
+fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) {
+    let mut open = app.ym_picker_open;
+
+    // 两个可点的文字按钮：年份、月份
+    let year_btn = {
+        let inner = egui::Frame::NONE
+            .fill(if open && app.ym_picker_mode.as_deref() == Some("year") {
+                theme::ACCENT_SOFT
+            } else {
+                Color32::TRANSPARENT
+            })
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(4, 2))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!("{} 年", selected.year()))
+                        .size(16.0)
+                        .strong()
+                        .color(theme::TEXT),
+                );
+            });
+        let r = inner.response.interact(egui::Sense::click());
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        r
+    };
+    ui.add_space(2.0);
+    let month_btn = {
+        let inner = egui::Frame::NONE
+            .fill(if open && app.ym_picker_mode.as_deref() == Some("month") {
+                theme::ACCENT_SOFT
+            } else {
+                Color32::TRANSPARENT
+            })
+            .corner_radius(egui::CornerRadius::same(6))
+            .inner_margin(egui::Margin::symmetric(4, 2))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(format!("{} 月", selected.month()))
+                        .size(16.0)
+                        .strong()
+                        .color(theme::TEXT),
+                );
+            });
+        let r = inner.response.interact(egui::Sense::click());
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        r
+    };
+
+    let clicked = if year_btn.clicked() {
+        Some("year")
+    } else if month_btn.clicked() {
+        Some("month")
+    } else {
+        None
+    };
+    if let Some(kind) = clicked {
+        // 两个面板互斥：点年份关月份，点月份关年份
+        if open && app.ym_picker_mode.as_deref() == Some(kind) {
+            open = false;
+        } else {
+            open = true;
+            app.ym_picker_mode = Some(kind.to_string());
+        }
+    }
+
+    if open {
+        let mode = app.ym_picker_mode.clone().unwrap_or_else(|| "month".into());
+        let id = egui::Id::new("ym_picker_popup");
+        let (rect, area_resp) = if mode == "year" {
+            let r = year_btn.rect;
+            let area = show_ym_panel(ui, id, r, |ui| {
+                ym_year_grid(app, ui, selected);
+            });
+            (r, area)
+        } else {
+            let r = month_btn.rect;
+            let area = show_ym_panel(ui, id, r, |ui| {
+                ym_month_grid(app, ui, selected);
+            });
+            (r, area)
+        };
+        // 点浮层和按钮之外 → 收起
+        if ui.input(|i| i.pointer.any_click()) {
+            if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
+                if !area_resp.contains(p) && !rect.contains(p) {
+                    app.ym_picker_open = false;
+                }
+            }
+        }
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            app.ym_picker_open = false;
+        }
+    } else {
+        app.ym_picker_open = false;
+    }
+}
+
+/// 年月选择浮层的容器：定位在触发按钮下方，卡片样式。
+fn show_ym_panel(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    anchor_rect: egui::Rect,
+    content: impl FnOnce(&mut egui::Ui),
+) -> egui::Rect {
+    let anchor = anchor_rect.left_bottom() + egui::vec2(0.0, 4.0);
+    let area = egui::Area::new(id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(anchor)
+        .constrain(true)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style())
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .corner_radius(egui::CornerRadius::same(12))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_width(300.0);
+                    content(ui);
+                });
+        });
+    area.response.rect
+}
+
+/// 年份网格：以当前年份为中心 ±12 年，6 列 5 行。
+fn ym_year_grid(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) {
+    let cur_year = selected.year();
+    ui.label(
+        RichText::new("选择年份")
+            .size(11.5)
+            .color(theme::TEXT_WEAK),
+    );
+    ui.add_space(6.0);
+    let mut picked: Option<i32> = None;
+    egui::Grid::new("ym_year_grid")
+        .num_columns(6)
+        .spacing([4.0, 4.0])
+        .show(ui, |ui| {
+            for y in (cur_year - 12)..=(cur_year + 12) {
+                let is_cur = y == cur_year;
+                let btn = egui::Button::new(
+                    RichText::new(y.to_string())
+                        .size(12.0)
+                        .color(if is_cur { Color32::WHITE } else { theme::TEXT }),
+                )
+                .fill(if is_cur { theme::ACCENT } else { theme::BG })
+                .corner_radius(egui::CornerRadius::same(6))
+                .min_size(egui::vec2(44.0, 28.0));
+                if ui.add(btn).clicked() {
+                    picked = Some(y);
+                }
+                // 6 个一行：本行第 6 个就换行
+                if (y - (cur_year - 12)) % 6 == 5 {
+                    ui.end_row();
+                }
+            }
+        });
+    if let Some(y) = picked {
+        app.selected_date = NaiveDate::from_ymd_opt(y, selected.month(), 1)
+            .unwrap_or(selected);
+        app.ym_picker_open = false; // 选完年份关掉（月份已在选中状态）
+    }
+}
+
+/// 月份网格：12 宫格。
+fn ym_month_grid(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) {
+    ui.label(
+        RichText::new(format!("{} 年 · 选择月份", selected.year()))
+            .size(11.5)
+            .color(theme::TEXT_WEAK),
+    );
+    ui.add_space(6.0);
+    let mut picked: Option<u32> = None;
+    egui::Grid::new("ym_month_grid")
+        .num_columns(4)
+        .spacing([4.0, 4.0])
+        .show(ui, |ui| {
+            for m in 1..=12u32 {
+                let is_cur = m == selected.month();
+                let btn = egui::Button::new(
+                    RichText::new(format!("{} 月", m))
+                        .size(12.5)
+                        .color(if is_cur { Color32::WHITE } else { theme::TEXT }),
+                )
+                .fill(if is_cur { theme::ACCENT } else { theme::BG })
+                .corner_radius(egui::CornerRadius::same(6))
+                .min_size(egui::vec2(64.0, 32.0));
+                if ui.add(btn).clicked() {
+                    picked = Some(m);
+                }
+                if m % 4 == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+    if let Some(m) = picked {
+        app.selected_date =
+            NaiveDate::from_ymd_opt(selected.year(), m, 1).unwrap_or(selected);
+        app.ym_picker_open = false;
+    }
+}
+
 /// 月历网格：上个月 / 月份标题 / 下个月 + 7 列日期格。
 fn month_grid(
     ui: &mut egui::Ui,
@@ -3034,12 +3250,6 @@ fn ui_calendar_hint(app: &mut PlanApp, ui: &mut egui::Ui, today: NaiveDate) {
                         theme::CARD_HOVER
                     },
                 );
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new("双击日历格子可打开当天记录")
-                        .size(11.0)
-                        .color(theme::TEXT_WEAK),
-                );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.add(button_mini("打开当天记录")).clicked() {
                         open = true;
@@ -3216,12 +3426,8 @@ fn ui_month_grid(app: &mut PlanApp, ui: &mut egui::Ui, today: NaiveDate) {
     let grid_start = first - ChronoDuration::days(lead);
 
     ui.horizontal(|ui| {
-        ui.label(
-            RichText::new(format!("{} 年 {} 月", selected.year(), selected.month()))
-                .size(16.0)
-                .strong()
-                .color(theme::TEXT),
-        );
+        // 年、月都是可点击的下拉：点开面板直接跳年/跳月，不用一格格翻。
+        year_month_picker(app, ui, selected);
         ui.add_space(8.0);
         legend_item(ui, theme::ACCENT, "有计划");
         legend_item(ui, theme::OK, "已完成");
@@ -5428,6 +5634,8 @@ mod workflow_tests {
             delete_prompt: None,
             record_delete_prompt: None,
             day_popup: None,
+            ym_picker_open: false,
+            ym_picker_mode: None,
             day_popup_rect: None,
             show_settings: false,
             cfg_kind: Kind::Local,
@@ -6681,6 +6889,8 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
 
 
 

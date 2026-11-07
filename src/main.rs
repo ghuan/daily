@@ -771,6 +771,8 @@ struct EditState {
     date_open: bool,
     /// 日期选择器浮层的屏幕矩形（供「点弹窗外关闭」排除）。
     date_popup_rect: Option<egui::Rect>,
+    /// 日期浮层子视图（0=日历 1=年份网格 2=月份网格）。
+    date_view: u8,
     /// 日期选择器当前翻到的月份（与选中日期解耦，翻月不会改选中值）。
     cal_month: NaiveDate,
     /// 时间选择器浮层是否展开。
@@ -806,6 +808,7 @@ impl EditState {
             year_day: today.day(),
             date_open: false,
             date_popup_rect: None,
+            date_view: 0,
             cal_month: today,
             time_open: false,
             time_popup_rect: None,
@@ -874,6 +877,7 @@ impl EditState {
             year_day,
             date_open: false,
             date_popup_rect: None,
+            date_view: 0,
             cal_month: today,
             time_open: false,
             time_popup_rect: None,
@@ -1128,9 +1132,13 @@ struct PlanApp {
     stats_end: NaiveDate,
     /// 统计页：起始日期选择器浮层状态。
     stats_start_open: bool,
+    /// 统计页：起始日期浮层子视图（0=日历 1=年 2=月）。
+    stats_start_view: u8,
     stats_start_month: NaiveDate,
     /// 统计页：结束日期选择器浮层状态。
     stats_end_open: bool,
+    /// 统计页：结束日期浮层子视图（0=日历 1=年 2=月）。
+    stats_end_view: u8,
     stats_end_month: NaiveDate,
     /// 统计页：显示过滤（0=全部 1=已完成 2=未完成）。
     stats_filter: u8,
@@ -1277,8 +1285,10 @@ impl PlanApp {
             stats_start: Local::now().date_naive() - ChronoDuration::days(30),
             stats_end: Local::now().date_naive(),
             stats_start_open: false,
+            stats_start_view: 0,
             stats_start_month: Local::now().date_naive(),
             stats_end_open: false,
+            stats_end_view: 0,
             stats_end_month: Local::now().date_naive(),
             stats_filter: 0,
             stats_page: 0,
@@ -2388,7 +2398,9 @@ fn date_picker(
     date: &mut NaiveDate,
     open: &mut bool,
     cal_month: &mut NaiveDate,
+    view: &mut u8,
     popup_rect_out: &mut Option<egui::Rect>,
+    id_salt: &str,
 ) -> egui::Response {
     let today = Local::now().date_naive();
     // 整块都可点：图标、文字、箭头任何位置点下去都能展开，
@@ -2437,7 +2449,7 @@ fn date_picker(
 
     if *open {
         let anchor = rect.left_bottom() + egui::vec2(0.0, 4.0);
-        let area = egui::Area::new(egui::Id::new("date_picker_popup"))
+        let area = egui::Area::new(egui::Id::new("date_picker_popup").with(id_salt))
             .order(egui::Order::Foreground)
             .fixed_pos(anchor)
             .constrain(true)
@@ -2449,7 +2461,7 @@ fn date_picker(
                     .inner_margin(egui::Margin::same(10))
                     .show(ui, |ui| {
                         ui.set_width(252.0);
-                        month_grid(ui, date, cal_month, today, open);
+                        month_grid(ui, date, cal_month, today, open, view, id_salt);
                     });
             });
         // 浮层矩形回填给调用方（编辑对话框的「点外面关闭」用它排除浮层区域）
@@ -2652,130 +2664,164 @@ fn ym_month_grid(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) {
     }
 }
 
-/// 月历网格：上个月 / 月份标题 / 下个月 + 7 列日期格。
+/// 月历网格：上个月 / 年月标题 / 下个月 + 7 列日期格。
+///
+/// `view` 控制浮层内显示哪一个子视图：0=日历网格，1=年份网格，2=月份网格。
+/// 点标题里的「N 年」→ 切到年份网格；点「N 月」→ 切到月份网格；
+/// 选完自动切回日历。全部用普通 Button，不依赖任何浮层/右键菜单。
 fn month_grid(
     ui: &mut egui::Ui,
     date: &mut NaiveDate,
     cal_month: &mut NaiveDate,
     today: NaiveDate,
     open: &mut bool,
+    view: &mut u8,
+    id_salt: &str,
 ) {
+    // ---- 标题行 ----
+    ui.horizontal(|ui| {
+        if *view == 0 && ui.add(button_mini("‹")).clicked() {
+            *cal_month = shift_month(*cal_month, -1);
+        }
+        ui.add_space(2.0);
+        let year_active = *view == 1;
+        let month_active = *view == 2;
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new(format!("{} 年", cal_month.year()))
+                        .size(12.5)
+                        .strong()
+                        .color(if year_active { theme::ACCENT } else { theme::TEXT }),
+                )
+                .fill(if year_active { theme::ACCENT_SOFT } else { Color32::TRANSPARENT })
+                .corner_radius(egui::CornerRadius::same(5)),
+            )
+            .on_hover_text("点击选择年份")
+            .clicked()
+        {
+            *view = if year_active { 0 } else { 1 };
+        }
+        if ui
+            .add(
+                egui::Button::new(
+                    RichText::new(format!("{} 月", cal_month.month()))
+                        .size(12.5)
+                        .strong()
+                        .color(if month_active { theme::ACCENT } else { theme::TEXT }),
+                )
+                .fill(if month_active { theme::ACCENT_SOFT } else { Color32::TRANSPARENT })
+                .corner_radius(egui::CornerRadius::same(5)),
+            )
+            .on_hover_text("点击选择月份")
+            .clicked()
+        {
+            *view = if month_active { 0 } else { 2 };
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if *view == 0 {
+                if ui.add(button_mini("›")).clicked() {
+                    *cal_month = shift_month(*cal_month, 1);
+                }
+                if *cal_month != today && ui.add(button_mini("今天")).clicked() {
+                    *cal_month = today;
+                    *date = today;
+                    *open = false;
+                }
+            }
+        });
+    });
+    ui.add_space(6.0);
+
+    // ---- 年份网格（view == 1）----
+    if *view == 1 {
+        let cur_year = cal_month.year();
+        let mut picked_year: Option<i32> = None;
+        egui::Grid::new(("date_pick_years", id_salt))
+            .num_columns(5)
+            .spacing([4.0, 4.0])
+            .show(ui, |ui| {
+                for (i, y) in ((cur_year - 6)..=(cur_year + 6)).enumerate() {
+                    let sel = y == cur_year;
+                    let btn = egui::Button::new(
+                        RichText::new(format!("{}", y))
+                            .size(12.0)
+                            .color(if sel { Color32::WHITE } else { theme::TEXT }),
+                    )
+                    .fill(if sel { theme::ACCENT } else { Color32::TRANSPARENT })
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .min_size(egui::vec2(38.0, 26.0));
+                    if ui.add(btn).clicked() {
+                        picked_year = Some(y);
+                    }
+                    if i % 5 == 4 {
+                        ui.end_row();
+                    }
+                }
+            });
+        if let Some(y) = picked_year {
+            // 保持「日」不变，月底溢出时 clamp
+            let d = cal_month.day();
+            let last = last_of_month(
+                NaiveDate::from_ymd_opt(y, cal_month.month(), 1).unwrap_or(*cal_month),
+            )
+            .day();
+            *cal_month = NaiveDate::from_ymd_opt(y, cal_month.month(), d.min(last))
+                .unwrap_or(*cal_month);
+            *view = 0;
+        }
+        return;
+    }
+
+    // ---- 月份网格（view == 2）----
+    if *view == 2 {
+        let mut picked_month: Option<u32> = None;
+        egui::Grid::new(("date_pick_months", id_salt))
+            .num_columns(4)
+            .spacing([4.0, 4.0])
+            .show(ui, |ui| {
+                for (i, m) in (1..=12u32).enumerate() {
+                    let sel = m == cal_month.month();
+                    let btn = egui::Button::new(
+                        RichText::new(format!("{} 月", m))
+                            .size(12.0)
+                            .color(if sel { Color32::WHITE } else { theme::TEXT }),
+                    )
+                    .fill(if sel { theme::ACCENT } else { Color32::TRANSPARENT })
+                    .corner_radius(egui::CornerRadius::same(6))
+                    .min_size(egui::vec2(44.0, 26.0));
+                    if ui.add(btn).clicked() {
+                        picked_month = Some(m);
+                    }
+                    if i % 4 == 3 {
+                        ui.end_row();
+                    }
+                }
+            });
+        if let Some(m) = picked_month {
+            let d = cal_month.day();
+            let last = last_of_month(
+                NaiveDate::from_ymd_opt(cal_month.year(), m, 1).unwrap_or(*cal_month),
+            )
+            .day();
+            *cal_month = NaiveDate::from_ymd_opt(cal_month.year(), m, d.min(last))
+                .unwrap_or(*cal_month);
+            *view = 0;
+        }
+        return;
+    }
+
+    // ---- 日历网格（view == 0）----
     let first = first_of_month(*cal_month);
     let last = last_of_month(*cal_month);
     let lead = first.weekday().num_days_from_monday() as i64;
     let cells = (lead + (last - first).num_days() + 1) as usize;
     let grid_start = first - ChronoDuration::days(lead);
 
-    ui.horizontal(|ui| {
-        if ui.add(button_mini("‹")).clicked() {
-            *cal_month = shift_month(*cal_month, -1);
-        }
-        ui.add_space(2.0);
-        // 年、月文字可点：点击弹上下文菜单快速选年/选月（不用一格一格翻）
-        let year_resp = ui
-            .add(
-                egui::Button::new(
-                    RichText::new(format!("{} 年", cal_month.year()))
-                        .size(12.5)
-                        .strong()
-                        .color(theme::TEXT),
-                )
-                .fill(Color32::TRANSPARENT)
-                .corner_radius(egui::CornerRadius::same(5)),
-            )
-            .on_hover_text("点击快速选择年份");
-        let month_resp = ui
-            .add(
-                egui::Button::new(
-                    RichText::new(format!("{} 月", cal_month.month()))
-                        .size(12.5)
-                        .strong()
-                        .color(theme::TEXT),
-                )
-                .fill(Color32::TRANSPARENT)
-                .corner_radius(egui::CornerRadius::same(5)),
-            )
-            .on_hover_text("点击快速选择月份");
-        // 年、月文字可点：右键/左键点击弹快捷菜单选年/选月（不用一格一格翻）
-        let year_resp = ui
-            .add(
-                egui::Button::new(
-                    RichText::new(format!("{} 年", cal_month.year()))
-                        .size(12.5)
-                        .strong()
-                        .color(theme::TEXT),
-                )
-                .fill(Color32::TRANSPARENT)
-                .corner_radius(egui::CornerRadius::same(5)),
-            )
-            .on_hover_text("点击快速选择年份");
-        year_resp.context_menu(|ui| {
-            ui.set_width(160.0);
-            ui.label(RichText::new("选择年份").size(11.0).color(theme::TEXT_WEAK));
-            let cur = cal_month.year();
-            for y in (cur - 6)..=(cur + 6) {
-                if ui.selectable_label(y == cur, format!("{} 年", y)).clicked() {
-                    // 保持日不变（月底溢出时 clamp）
-                    let d = cal_month.day();
-                    let last = last_of_month(
-                        NaiveDate::from_ymd_opt(y, cal_month.month(), 1)
-                            .unwrap_or(*cal_month),
-                    )
-                    .day();
-                    *cal_month =
-                        NaiveDate::from_ymd_opt(y, cal_month.month(), d.min(last))
-                            .unwrap_or(*cal_month);
-                    ui.close();
-                }
-            }
-        });
-        let month_resp = ui
-            .add(
-                egui::Button::new(
-                    RichText::new(format!("{} 月", cal_month.month()))
-                        .size(12.5)
-                        .strong()
-                        .color(theme::TEXT),
-                )
-                .fill(Color32::TRANSPARENT)
-                .corner_radius(egui::CornerRadius::same(5)),
-            )
-            .on_hover_text("点击快速选择月份");
-        month_resp.context_menu(|ui| {
-            ui.set_width(120.0);
-            ui.label(RichText::new("选择月份").size(11.0).color(theme::TEXT_WEAK));
-            for m in 1..=12u32 {
-                if ui.selectable_label(m == cal_month.month(), format!("{} 月", m)).clicked() {
-                    let d = cal_month.day();
-                    let last = last_of_month(
-                        NaiveDate::from_ymd_opt(cal_month.year(), m, 1)
-                            .unwrap_or(*cal_month),
-                    )
-                    .day();
-                    *cal_month =
-                        NaiveDate::from_ymd_opt(cal_month.year(), m, d.min(last))
-                            .unwrap_or(*cal_month);
-                    ui.close();
-                }
-            }
-        });
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.add(button_mini("›")).clicked() {
-                *cal_month = shift_month(*cal_month, 1);
-            }
-            if *cal_month != today && ui.add(button_mini("今天")).clicked() {
-                *cal_month = today;
-                *date = today;
-                *open = false;
-            }
-        });
-    });
-    ui.add_space(6.0);
-
     // 用真实的 Button + Grid 排日期格：自绘 `ui.interact` 在浮层里收不到点击，
     // 而 Button 走的是标准交互路径，行为稳定（时间选择器同款做法）。
     let mut picked: Option<NaiveDate> = None;
-    egui::Grid::new("date_pick_grid")
+    egui::Grid::new(("date_pick_grid", id_salt))
         .num_columns(7)
         .spacing([3.0, 3.0])
         .show(ui, |ui| {
@@ -4265,7 +4311,9 @@ fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                     &mut app.stats_start,
                     &mut app.stats_start_open,
                     &mut app.stats_start_month,
+                    &mut app.stats_start_view,
                     &mut None,
+                    "stats_start",
                 );
                 ui.label(RichText::new("至").size(12.0).color(theme::TEXT_WEAK));
                 date_picker(
@@ -4273,7 +4321,9 @@ fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                     &mut app.stats_end,
                     &mut app.stats_end_open,
                     &mut app.stats_end_month,
+                    &mut app.stats_end_view,
                     &mut None,
+                    "stats_end",
                 );
                 if ui.add(button_mini("回到今天")).clicked() {
                     app.stats_start = Local::now().date_naive();
@@ -5381,7 +5431,9 @@ fn ui_edit_dialog(app: &mut PlanApp, ctx: &egui::Context) {
                             &mut state.date,
                             &mut state.date_open,
                             &mut state.cal_month,
+                            &mut state.date_view,
                             &mut state.date_popup_rect,
+                            "edit_date",
                         );
                     });
                     ui.add_space(12.0);
@@ -6054,8 +6106,10 @@ mod workflow_tests {
             stats_start: Local::now().date_naive() - ChronoDuration::days(30),
             stats_end: Local::now().date_naive(),
             stats_start_open: false,
+            stats_start_view: 0,
             stats_start_month: Local::now().date_naive(),
             stats_end_open: false,
+            stats_end_view: 0,
             stats_end_month: Local::now().date_naive(),
             stats_filter: 0,
             stats_page: 0,
@@ -7307,6 +7361,10 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
+
 
 
 

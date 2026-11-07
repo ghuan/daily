@@ -2496,13 +2496,13 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
             month_btn.rect
         };
 
-        // ★「点外面关闭」的输入级实现：本帧发生主键点击（press+release），
-        // 且指针位置不在面板 rect 内 → 收起。用的是全局输入（primary_clicked
+        // ★「点外面关闭」的输入级实现：主键**按下**的那一帧（不等松开），
+        // 指针位置不在面板 rect 内 → 立即收起。用全局输入（primary_pressed
         // + interact_pos），完全不依赖 egui 的 hit-test —— 此前的 Area 拦截层
         // 方案被其它持久化浮层的死 widget 抢走点击（实测），输入级判定没有这个坑。
         // 注意：打开动作本身的点击在面板 rect 内（点的是年/月按钮），天然不会误关。
         let released_outside = ui.input(|i| {
-            if !i.pointer.primary_clicked() {
+            if !i.pointer.primary_pressed() {
                 return false;
             }
             let Some(pos) = i.pointer.interact_pos() else {
@@ -6953,6 +6953,7 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
 
 
 

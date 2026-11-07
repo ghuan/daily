@@ -2478,14 +2478,30 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
         .min_size(egui::vec2(0.0, 26.0)),
     );
 
-    // 年份面板。open 用本地镜像（Popup 借用），结束写回 app——
-    // content 闭包也需要 app，不能让 Popup 持有它的可变借用。
-    let mut year_open = app.ym_picker_open && app.ym_picker_mode.as_deref() == Some("year");
-    let year_popup = egui::Popup::from_toggle_button_response(&year_btn)
-        .id(egui::Id::new("ym_year_popup"))
+    // 按钮点击 → 显式翻转开关状态（不要依赖 from_toggle_button_response 的
+    // 内建 toggle：它会被 open_bool 覆盖，导致点击永远不打开面板）。
+    let year_open = app.ym_picker_open && app.ym_picker_mode.as_deref() == Some("year");
+    let month_open = app.ym_picker_open && app.ym_picker_mode.as_deref() == Some("month");
+    if year_btn.clicked() {
+        // 点年份：关月份；年份开着则收起，否则展开
+        app.ym_picker_open = !year_open;
+        app.ym_picker_mode = Some("year".to_string());
+    } else if month_btn.clicked() {
+        app.ym_picker_open = !month_open;
+        app.ym_picker_mode = Some("month".to_string());
+    }
+
+    // 当前应显示哪个面板
+    let year_open = app.ym_picker_open && app.ym_picker_mode.as_deref() == Some("year");
+    let month_open = app.ym_picker_open && app.ym_picker_mode.as_deref() == Some("month");
+
+    // 年份面板。Popup::new + open_bool 纯绑定：外点关闭 / Esc 由 Popup 内置
+    // （CloseOnClickOutside），状态通过 open_bool 双向同步。
+    let mut year_open = year_open;
+    let year_popup = egui::Popup::new(egui::Id::new("ym_year_popup"), ui.ctx().clone(), year_btn.rect, year_btn.layer_id)
+        .open_bool(&mut year_open)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .width(300.0)
-        .open_bool(&mut year_open)
         .frame(
             egui::Frame::popup(ui.style())
                 .fill(theme::CARD)
@@ -2497,12 +2513,11 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
             ym_year_grid(app, ui, selected);
         });
     // 月份面板
-    let mut month_open = app.ym_picker_open && app.ym_picker_mode.as_deref() == Some("month");
-    let month_popup = egui::Popup::from_toggle_button_response(&month_btn)
-        .id(egui::Id::new("ym_month_popup"))
+    let mut month_open = month_open;
+    let month_popup = egui::Popup::new(egui::Id::new("ym_month_popup"), ui.ctx().clone(), month_btn.rect, month_btn.layer_id)
+        .open_bool(&mut month_open)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .width(300.0)
-        .open_bool(&mut month_open)
         .frame(
             egui::Frame::popup(ui.style())
                 .fill(theme::CARD)
@@ -2514,26 +2529,7 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
             ym_month_grid(app, ui, selected);
         });
 
-    // 状态合成：任一面板显示中 → 记录哪个；两个都没显示 → 关闭。
-    // Popup 内建的外点/Esc 关闭会改写 year_open/month_open 本地镜像，
-    // 这里统一写回 app（连 mode 一起，保证高亮按钮与面板一致）。
-    if year_popup.is_some() {
-        app.ym_picker_open = true;
-        app.ym_picker_mode = Some("year".to_string());
-    } else if month_popup.is_some() {
-        app.ym_picker_open = true;
-        app.ym_picker_mode = Some("month".to_string());
-    } else {
-        app.ym_picker_open = false;
-    }
-    // 面板内容里的「选完关闭」（ym_*_grid 设置的标志）也要尊重：
-    // ym_year_grid / ym_month_grid 通过 app.ym_picker_open=false 关面板，
-    // 而 Popup 用的是本地镜像——把 app 的关闭意图传导给镜像。
-    if !app.ym_picker_open {
-        year_open = false;
-        month_open = false;
-    }
-    // 下帧的初始状态 = 本帧结束时的真实状态
+    // Popup 内建的外点/Esc 关闭会改写本地镜像；同步回 app。
     app.ym_picker_open = year_open || month_open;
     if year_open {
         app.ym_picker_mode = Some("year".to_string());

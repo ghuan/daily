@@ -2489,12 +2489,13 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
 
     if open {
         let mode = app.ym_picker_mode.clone().unwrap_or_else(|| "month".into());
-        // 全屏透明拦截层：面板打开时铺在最上层，点任何地方都先落在它上面——
-        // 点到它（=点面板外）就收起。这是「点外部关闭」最可靠的实现，
-        // 不依赖 any_click 的派发细节。拦截层必须在面板之下（先画）。
+        // 全屏透明拦截层：铺在 Foreground 层，面板用 Tooltip 层盖在它上面。
+        // 点面板外任何位置 → 命中拦截层 → 收起；点面板内 → 面板控件接管。
+        // 拦截层自身也要标 interactable 之外无默认行为，用 Sense::click 显式感知。
         let intercept = egui::Area::new(egui::Id::new("ym_picker_intercept"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::pos2(0.0, 0.0))
+            .interactable(true)
             .show(ui.ctx(), |ui| {
                 let screen = ui.max_rect();
                 let (r, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
@@ -2529,6 +2530,9 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
 }
 
 /// 年月选择浮层的容器：定位在触发按钮下方，卡片样式。
+///
+/// 返回浮层矩形；并保证面板在拦截层（`ym_picker_intercept`）之上：
+/// 用 `Order::Tooltip`（高于 Foreground）+ `move_to_top` 钉住。
 fn show_ym_panel(
     ui: &mut egui::Ui,
     id: egui::Id,
@@ -2537,7 +2541,7 @@ fn show_ym_panel(
 ) -> egui::Rect {
     let anchor = anchor_rect.left_bottom() + egui::vec2(0.0, 4.0);
     let area = egui::Area::new(id)
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Tooltip)
         .fixed_pos(anchor)
         .constrain(true)
         .show(ui.ctx(), |ui| {
@@ -6946,6 +6950,7 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
 
 
 

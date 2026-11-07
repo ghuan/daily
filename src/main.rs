@@ -19,7 +19,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuIt
 use tray_icon::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use uuid::Uuid;
 
-use model::{DayRecord, Doc, Plan, RemindWindow, RepeatRule};
+use model::{fmt_time, DayRecord, Doc, Plan, RemindWindow, RepeatRule};
 use store::{DocStore, GitConfig, GitStore, Kind, Settings};
 
 const APP_TITLE: &str = "小铃 · 计划与提醒";
@@ -693,11 +693,21 @@ enum SyncMsg {
 
 // ============================== 编辑对话框状态 ==============================
 
-/// 主界面的页面。日期记录与提醒模板分开管理，后续可继续加入每周/每月回顾等模块。
+/// 主界面的页面。日期记录与提醒模板分开管理，统计按日历范围查询。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspacePage {
     Calendar,
     Templates,
+    Stats,
+}
+
+/// 统计页的范围粒度。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatsScope {
+    Day,
+    Week,
+    Month,
+    Year,
 }
 
 /// 日期记录的显示范围。真正的数据始终按具体日期保存。
@@ -1121,6 +1131,14 @@ struct PlanApp {
     conflict_scan_running: bool,
     /// 冲突副本管理弹窗是否打开。
     show_conflicts: bool,
+    /// 统计页：范围粒度。
+    stats_scope: StatsScope,
+    /// 统计页：显示过滤（0=全部 1=已完成 2=未完成）。
+    stats_filter: u8,
+    /// 统计页：当前页码。
+    stats_page: usize,
+    /// 统计页：基准日期选择器的翻月状态。
+    stats_cal_month: NaiveDate,
     /// 弹窗刚被打开的帧标记：这一帧的点击是「打开动作本身」，
     /// 外点检测必须跳过，否则弹窗会被同一次点击立即关闭。
     dialog_just_opened: bool,
@@ -1259,6 +1277,10 @@ impl PlanApp {
             conflict_branches: None,
             conflict_scan_running: false,
             show_conflicts: false,
+            stats_scope: StatsScope::Month,
+            stats_filter: 0,
+            stats_page: 0,
+            stats_cal_month: Local::now().date_naive(),
             dialog_just_opened: false,
             conflict_view: None,
             conflict_doc: None,
@@ -2155,6 +2177,7 @@ impl eframe::App for PlanApp {
         match self.page {
             WorkspacePage::Calendar => ui_calendar_workspace(self, ui),
             WorkspacePage::Templates => ui_template_workspace(self, ui),
+            WorkspacePage::Stats => ui_stats_workspace(self, ui),
         }
         ui_record_view_dialog(self, ctx);
         ui_day_popup(self, ctx);
@@ -3009,38 +3032,22 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                 });
             });
             ui.add_space(28.0);
-            ui.label(
-                RichText::new("日程")
-                    .size(10.5)
-                    .strong()
-                    .color(Color32::from_rgb(116, 128, 158)),
-            );
-            ui.add_space(6.0);
             if nav_item(ui, "▦", "日期记录", app.page == WorkspacePage::Calendar).clicked() {
                 app.page = WorkspacePage::Calendar;
             }
-            ui.add_space(18.0);
-            ui.label(
-                RichText::new("自动化")
-                    .size(10.5)
-                    .strong()
-                    .color(Color32::from_rgb(116, 128, 158)),
-            );
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             if nav_item(ui, "⟳", "提醒模板", app.page == WorkspacePage::Templates).clicked() {
                 app.page = WorkspacePage::Templates;
             }
+            ui.add_space(4.0);
             if nav_item(ui, "＋", "新建模板", false).clicked() {
                 app.open_edit_state(EditState::new_template());
             }
-            ui.add_space(18.0);
-            ui.label(
-                RichText::new("工作台")
-                    .size(10.5)
-                    .strong()
-                    .color(Color32::from_rgb(116, 128, 158)),
-            );
-            ui.add_space(6.0);
+            ui.add_space(4.0);
+            if nav_item(ui, "📊", "统计", app.page == WorkspacePage::Stats).clicked() {
+                app.page = WorkspacePage::Stats;
+            }
+            ui.add_space(4.0);
             if nav_item(ui, "⚙", "设置", false).clicked() {
                 open_settings(app);
             }
@@ -3533,11 +3540,8 @@ fn ui_month_grid(app: &mut PlanApp, ui: &mut egui::Ui, today: NaiveDate) {
         );
 
         if in_month && data.total > 0 {
-            let color = if data.done == data.total {
-                theme::OK
-            } else {
-                theme::ACCENT
-            };
+            // 只画「有计划」的蓝点；完成状态由格内标题淡化表现
+            let color = theme::ACCENT;
             painter.circle_filled(
                 egui::pos2(cell.right() - 10.0, cell.top() + 11.0),
                 3.5,
@@ -3548,7 +3552,7 @@ fn ui_month_grid(app: &mut PlanApp, ui: &mut egui::Ui, today: NaiveDate) {
         if in_month && !data.entries.is_empty() {
             let clip = cell.shrink2(egui::vec2(6.0, 4.0));
             let cp = painter.with_clip_rect(clip);
-            let mut y = cell.top() + 24.0;
+            let mut y = cell.top() + 30.0;
             for (title, done) in data.entries.iter().take(3) {
                 let color = if *done { theme::TEXT_WEAK } else { theme::TEXT };
                 cp.text(
@@ -3569,12 +3573,12 @@ fn ui_month_grid(app: &mut PlanApp, ui: &mut egui::Ui, today: NaiveDate) {
                     theme::TEXT_WEAK,
                 );
             }
-        } else if in_month && data.cancelled {
-            painter.text(
-                egui::pos2(cell.left() + 9.0, cell.top() + 26.0),
-                egui::Align2::LEFT_TOP,
-                "已删除",
-                egui::FontId::proportional(10.0),
+        } else if in_month && data.cancelled && data.entries.is_empty() {
+            // 空格子但有已删除记录：显示淡化提示（用户要求去掉「已删除」文字，
+            // 改为一个居中的淡点占位，避免与标题重叠）
+            painter.circle_filled(
+                egui::pos2(cell.left() + 13.0, cell.top() + 30.0),
+                2.5,
                 Color32::from_rgb(190, 195, 208),
             );
         }
@@ -4133,6 +4137,267 @@ fn ui_template_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
         });
 }
 
+
+// ============================== 统计页 ==============================
+
+/// 统计页：按日历范围（日 / 周 / 月 / 年）查询范围内记录的完成情况，
+/// 分页展示明细。只读——这里不做任何增删改。
+fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
+    egui::CentralPanel::default()
+        .frame(
+            egui::Frame::NONE
+                .fill(theme::BG)
+                .inner_margin(egui::Margin::symmetric(26, 22)),
+        )
+        .show_inside(root, |ui| {
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new("统计")
+                            .size(24.0)
+                            .strong()
+                            .color(theme::TEXT),
+                    );
+                    ui.label(
+                        RichText::new("按日历范围查看记录完成情况；可以过滤已完成 / 未完成")
+                            .size(12.0)
+                            .color(theme::TEXT_WEAK),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add(button_ghost("← 返回日程")).clicked() {
+                        app.page = WorkspacePage::Calendar;
+                    }
+                });
+            });
+            ui.add_space(14.0);
+
+            // ---- 范围选择（日 / 周 / 月 / 年），锚定当前选中日期 ----
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("范围").size(12.0).color(theme::TEXT_WEAK));
+                let anchor = app.selected_date;
+                let (cur_start, cur_end) = stats_range(app.stats_scope, anchor);
+                let mut label = |name: &str, sel: bool| -> egui::Response {
+                    ui.add(egui::Button::new(
+                        RichText::new(name)
+                            .size(12.0)
+                            .strong()
+                            .color(if sel { Color32::WHITE } else { theme::TEXT }),
+                    )
+                    .fill(if sel { theme::ACCENT } else { theme::CARD })
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                    .corner_radius(egui::CornerRadius::same(8))
+                    .min_size(egui::vec2(52.0, 28.0)))
+                };
+                if label("日", app.stats_scope == StatsScope::Day).clicked() {
+                    app.stats_scope = StatsScope::Day;
+                }
+                if label("周", app.stats_scope == StatsScope::Week).clicked() {
+                    app.stats_scope = StatsScope::Week;
+                }
+                if label("月", app.stats_scope == StatsScope::Month).clicked() {
+                    app.stats_scope = StatsScope::Month;
+                }
+                if label("年", app.stats_scope == StatsScope::Year).clicked() {
+                    app.stats_scope = StatsScope::Year;
+                }
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(format!(
+                        "{} ~ {}",
+                        cur_start.format("%Y-%m-%d"),
+                        cur_end.format("%Y-%m-%d")
+                    ))
+                    .size(12.0)
+                    .color(theme::TEXT_WEAK),
+                );
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("基准日期").size(12.0).color(theme::TEXT_WEAK));
+                date_picker(
+                    ui,
+                    &mut app.selected_date,
+                    &mut false,
+                    &mut app.stats_cal_month,
+                    &mut None,
+                );
+                if ui.add(button_mini("回到今天")).clicked() {
+                    app.selected_date = Local::now().date_naive();
+                }
+            });
+            ui.add_space(12.0);
+
+            // ---- 汇总 ----
+            let (start, end) = stats_range(app.stats_scope, app.selected_date);
+            let mut in_range: Vec<&DayRecord> = app
+                .doc
+                .records
+                .iter()
+                .filter(|r| r.date >= start && r.date <= end && !r.cancelled)
+                .collect();
+            in_range.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.time.cmp(&b.time)));
+            let total = in_range.len();
+            let done = in_range.iter().filter(|r| r.done).count();
+            let undone = total - done;
+            let show_filter = app.stats_filter;
+            let shown: Vec<&DayRecord> = in_range
+                .iter()
+                .copied()
+                .filter(|r| match show_filter {
+                    0 => true,
+                    1 => r.done,
+                    _ => !r.done,
+                })
+                .collect();
+
+            ui.horizontal(|ui| {
+                stat_card(ui, "记录总数", &total.to_string(), theme::ACCENT);
+                stat_card(ui, "已完成", &done.to_string(), theme::OK);
+                stat_card(ui, "未完成", &undone.to_string(), theme::WARN);
+            });
+            ui.add_space(12.0);
+
+            // ---- 过滤 ----
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("显示").size(12.0).color(theme::TEXT_WEAK));
+                let mut chip = |name: &str, val: u8| -> egui::Response {
+                    ui.add(egui::Button::new(
+                        RichText::new(name)
+                            .size(11.5)
+                            .strong()
+                            .color(if show_filter == val { Color32::WHITE } else { theme::TEXT }),
+                    )
+                    .fill(if show_filter == val { theme::ACCENT } else { theme::CARD })
+                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                    .corner_radius(egui::CornerRadius::same(7))
+                    .min_size(egui::vec2(64.0, 26.0)))
+                };
+                if chip("全部", 0).clicked() {
+                    app.stats_filter = 0;
+                }
+                if chip("已完成", 1).clicked() {
+                    app.stats_filter = 1;
+                }
+                if chip("未完成", 2).clicked() {
+                    app.stats_filter = 2;
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    // 分页：上一页 / 下一页
+                    let per_page = 20usize;
+                    let pages = shown.len().div_ceil(per_page).max(1);
+                    if app.stats_page >= pages {
+                        app.stats_page = pages - 1;
+                    }
+                    if ui.add(button_mini("‹ 上一页")).clicked() && app.stats_page > 0 {
+                        app.stats_page -= 1;
+                    }
+                    ui.label(
+                        RichText::new(format!("{}/{} 页", app.stats_page + 1, pages))
+                            .size(11.5)
+                            .color(theme::TEXT_WEAK),
+                    );
+                    if ui.add(button_mini("下一页 ›")).clicked() && app.stats_page + 1 < pages {
+                        app.stats_page += 1;
+                    }
+                });
+            });
+            ui.add_space(8.0);
+
+            // ---- 明细分页列表 ----
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let per_page = 20usize;
+                let skip = app.stats_page * per_page;
+                let page_items: Vec<&DayRecord> =
+                    shown.iter().skip(skip).take(per_page).copied().collect();
+                if page_items.is_empty() {
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("这个范围内没有记录")
+                            .size(13.0)
+                            .color(theme::TEXT_WEAK),
+                    );
+                } else {
+                    for r in page_items {
+                        ui.horizontal(|ui| {
+                            let state_icon = if r.done { "✓" } else { "○" };
+                            let state_color = if r.done { theme::OK } else { theme::TEXT_WEAK };
+                            ui.label(
+                                RichText::new(state_icon)
+                                    .size(14.0)
+                                    .strong()
+                                    .color(state_color),
+                            );
+                            ui.label(
+                                RichText::new(format!("{}", r.date.format("%m-%d")))
+                                    .size(12.5)
+                                    .color(theme::TEXT_WEAK),
+                            );
+                            ui.label(
+                                RichText::new(&r.title)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(theme::TEXT),
+                            );
+                            if !r.tag.is_empty() {
+                                tag_badge_light(ui, &r.tag);
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if let Some(t) = r.done_at {
+                                    ui.label(
+                                        RichText::new(format!("完成于 {}", t.format("%m-%d %H:%M")))
+                                            .size(11.0)
+                                            .color(theme::TEXT_WEAK),
+                                    );
+                                } else {
+                                    ui.label(
+                                        RichText::new(fmt_time(r.time))
+                                            .size(11.0)
+                                            .color(theme::TEXT_WEAK),
+                                    );
+                                }
+                            });
+                        });
+                        ui.add_space(3.0);
+                    }
+                }
+            });
+        });
+}
+
+/// 统计页的范围计算：以 anchor 为基准的 日/周/月/年 区间。
+fn stats_range(scope: StatsScope, anchor: NaiveDate) -> (NaiveDate, NaiveDate) {
+    match scope {
+        StatsScope::Day => (anchor, anchor),
+        StatsScope::Week => {
+            let s = anchor - ChronoDuration::days(anchor.weekday().num_days_from_monday() as i64);
+            (s, s + ChronoDuration::days(6))
+        }
+        StatsScope::Month => (first_of_month(anchor), last_of_month(anchor)),
+        StatsScope::Year => {
+            let y = anchor.year();
+            (
+                NaiveDate::from_ymd_opt(y, 1, 1).unwrap_or(anchor),
+                NaiveDate::from_ymd_opt(y, 12, 31).unwrap_or(anchor),
+            )
+        }
+    }
+}
+
+/// 统计页顶部的一张汇总卡。
+fn stat_card(ui: &mut egui::Ui, label: &str, value: &str, color: Color32) {
+    egui::Frame::NONE
+        .fill(theme::CARD)
+        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+        .corner_radius(egui::CornerRadius::same(10))
+        .inner_margin(egui::Margin::symmetric(18, 12))
+        .show(ui, |ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(value).size(22.0).strong().color(color));
+                ui.label(RichText::new(label).size(11.0).color(theme::TEXT_WEAK));
+            });
+        });
+}
 fn template_card(
     ui: &mut egui::Ui,
     t: &Plan,
@@ -5757,6 +6022,10 @@ mod workflow_tests {
             conflict_branches: None,
             conflict_scan_running: false,
             show_conflicts: false,
+            stats_scope: StatsScope::Month,
+            stats_filter: 0,
+            stats_page: 0,
+            stats_cal_month: Local::now().date_naive(),
             dialog_just_opened: false,
             conflict_view: None,
             conflict_doc: None,
@@ -7005,6 +7274,14 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
+
+
+
+
+
 
 
 

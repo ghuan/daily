@@ -4480,7 +4480,7 @@ fn nav_item(ui: &mut egui::Ui, icon: &str, text: &str, active: bool) -> egui::Re
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(icon).size(13.0).color(fg));
+                ui.label(RichText::new(icon).size(16.0).color(fg));
                 ui.add_space(4.0);
                 ui.label(RichText::new(text).size(13.0).strong().color(fg));
             });
@@ -7265,6 +7265,7 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
 
 
 

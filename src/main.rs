@@ -1237,24 +1237,15 @@ impl PlanApp {
     ///
     /// - 队列空 → 入队开始计时；
     /// - 已有消息且**尚未开始推送** → 丢弃旧消息，新消息重新计时（合并连续编辑）；
-    /// - **正在推送** → 正常排队，当前任务结束后由 `poll_sync` 照常执行。
+    /// - **正在推送** → 正常排队，同样等满 5 分钟。当前任务结束后若尚未到期，
+    ///   消息留在队列等 tick 检查；到期才执行。
     ///
-    /// 到期执行时的完整动作见 `run_due_push`：先 pull 再 push。
+    /// 三种情况都统一「等满 5 分钟」，行为一致、更好解释：改动只管入队，
+    /// 推送时刻永远是最后一次入队 + PUSH_DELAY。
     fn enqueue_push(&mut self, reason: String) {
         if self.settings.kind != Kind::Git || !git_ready(&self.settings) {
             return;
         }
-        if self.syncing {
-            // 正在推送：正常排队（不走「丢弃旧消息」分支，保证这次改动不会丢）。
-            // 当前任务结束时 poll_sync 会把队列里的消息继续执行。
-            self.push_queue = Some(PushQueueEntry {
-                queued_at: Instant::now() - PUSH_DELAY, // 立即到期
-                reason,
-            });
-            return;
-        }
-        // 未在推送：无论队列里有没有旧消息，都替换为新消息并重新计时。
-        // （旧消息描述的改动早已包含在本地数据里，丢了描述不丢数据。）
         self.push_queue = Some(PushQueueEntry {
             queued_at: Instant::now(),
             reason,

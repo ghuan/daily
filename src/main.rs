@@ -701,14 +701,6 @@ enum WorkspacePage {
     Stats,
 }
 
-/// 统计页的范围粒度。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StatsScope {
-    Day,
-    Week,
-    Month,
-    Year,
-}
 
 /// 日期记录的显示范围。真正的数据始终按具体日期保存。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1131,14 +1123,19 @@ struct PlanApp {
     conflict_scan_running: bool,
     /// 冲突副本管理弹窗是否打开。
     show_conflicts: bool,
-    /// 统计页：范围粒度。
-    stats_scope: StatsScope,
+    /// 统计页：范围起止日期。
+    stats_start: NaiveDate,
+    stats_end: NaiveDate,
+    /// 统计页：起始日期选择器浮层状态。
+    stats_start_open: bool,
+    stats_start_month: NaiveDate,
+    /// 统计页：结束日期选择器浮层状态。
+    stats_end_open: bool,
+    stats_end_month: NaiveDate,
     /// 统计页：显示过滤（0=全部 1=已完成 2=未完成）。
     stats_filter: u8,
     /// 统计页：当前页码。
     stats_page: usize,
-    /// 统计页：基准日期选择器的翻月状态。
-    stats_cal_month: NaiveDate,
     /// 弹窗刚被打开的帧标记：这一帧的点击是「打开动作本身」，
     /// 外点检测必须跳过，否则弹窗会被同一次点击立即关闭。
     dialog_just_opened: bool,
@@ -1277,10 +1274,14 @@ impl PlanApp {
             conflict_branches: None,
             conflict_scan_running: false,
             show_conflicts: false,
-            stats_scope: StatsScope::Month,
+            stats_start: Local::now().date_naive() - ChronoDuration::days(30),
+            stats_end: Local::now().date_naive(),
+            stats_start_open: false,
+            stats_start_month: Local::now().date_naive(),
+            stats_end_open: false,
+            stats_end_month: Local::now().date_naive(),
             stats_filter: 0,
             stats_page: 0,
-            stats_cal_month: Local::now().date_naive(),
             dialog_just_opened: false,
             conflict_view: None,
             conflict_doc: None,
@@ -4174,64 +4175,37 @@ fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
             });
             ui.add_space(14.0);
 
-            // ---- 范围选择（日 / 周 / 月 / 年），锚定当前选中日期 ----
+            // ---- 范围：两个日期组件（起 / 止） ----
             ui.horizontal(|ui| {
                 ui.label(RichText::new("范围").size(12.0).color(theme::TEXT_WEAK));
-                let anchor = app.selected_date;
-                let (cur_start, cur_end) = stats_range(app.stats_scope, anchor);
-                let mut label = |name: &str, sel: bool| -> egui::Response {
-                    ui.add(egui::Button::new(
-                        RichText::new(name)
-                            .size(12.0)
-                            .strong()
-                            .color(if sel { Color32::WHITE } else { theme::TEXT }),
-                    )
-                    .fill(if sel { theme::ACCENT } else { theme::CARD })
-                    .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
-                    .corner_radius(egui::CornerRadius::same(8))
-                    .min_size(egui::vec2(52.0, 28.0)))
-                };
-                if label("日", app.stats_scope == StatsScope::Day).clicked() {
-                    app.stats_scope = StatsScope::Day;
-                }
-                if label("周", app.stats_scope == StatsScope::Week).clicked() {
-                    app.stats_scope = StatsScope::Week;
-                }
-                if label("月", app.stats_scope == StatsScope::Month).clicked() {
-                    app.stats_scope = StatsScope::Month;
-                }
-                if label("年", app.stats_scope == StatsScope::Year).clicked() {
-                    app.stats_scope = StatsScope::Year;
-                }
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new(format!(
-                        "{} ~ {}",
-                        cur_start.format("%Y-%m-%d"),
-                        cur_end.format("%Y-%m-%d")
-                    ))
-                    .size(12.0)
-                    .color(theme::TEXT_WEAK),
-                );
-            });
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("基准日期").size(12.0).color(theme::TEXT_WEAK));
                 date_picker(
                     ui,
-                    &mut app.selected_date,
-                    &mut false,
-                    &mut app.stats_cal_month,
+                    &mut app.stats_start,
+                    &mut app.stats_start_open,
+                    &mut app.stats_start_month,
+                    &mut None,
+                );
+                ui.label(RichText::new("至").size(12.0).color(theme::TEXT_WEAK));
+                date_picker(
+                    ui,
+                    &mut app.stats_end,
+                    &mut app.stats_end_open,
+                    &mut app.stats_end_month,
                     &mut None,
                 );
                 if ui.add(button_mini("回到今天")).clicked() {
-                    app.selected_date = Local::now().date_naive();
+                    app.stats_start = Local::now().date_naive();
+                    app.stats_end = Local::now().date_naive();
+                }
+                // 起止颠倒时自动交换
+                if app.stats_end < app.stats_start {
+                    std::mem::swap(&mut app.stats_start, &mut app.stats_end);
                 }
             });
             ui.add_space(12.0);
 
             // ---- 汇总 ----
-            let (start, end) = stats_range(app.stats_scope, app.selected_date);
+            let (start, end) = (app.stats_start, app.stats_end);
             let mut in_range: Vec<&DayRecord> = app
                 .doc
                 .records
@@ -4370,24 +4344,6 @@ fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
         });
 }
 
-/// 统计页的范围计算：以 anchor 为基准的 日/周/月/年 区间。
-fn stats_range(scope: StatsScope, anchor: NaiveDate) -> (NaiveDate, NaiveDate) {
-    match scope {
-        StatsScope::Day => (anchor, anchor),
-        StatsScope::Week => {
-            let s = anchor - ChronoDuration::days(anchor.weekday().num_days_from_monday() as i64);
-            (s, s + ChronoDuration::days(6))
-        }
-        StatsScope::Month => (first_of_month(anchor), last_of_month(anchor)),
-        StatsScope::Year => {
-            let y = anchor.year();
-            (
-                NaiveDate::from_ymd_opt(y, 1, 1).unwrap_or(anchor),
-                NaiveDate::from_ymd_opt(y, 12, 31).unwrap_or(anchor),
-            )
-        }
-    }
-}
 
 fn template_card(
     ui: &mut egui::Ui,
@@ -6013,10 +5969,14 @@ mod workflow_tests {
             conflict_branches: None,
             conflict_scan_running: false,
             show_conflicts: false,
-            stats_scope: StatsScope::Month,
+            stats_start: Local::now().date_naive() - ChronoDuration::days(30),
+            stats_end: Local::now().date_naive(),
+            stats_start_open: false,
+            stats_start_month: Local::now().date_naive(),
+            stats_end_open: false,
+            stats_end_month: Local::now().date_naive(),
             stats_filter: 0,
             stats_page: 0,
-            stats_cal_month: Local::now().date_naive(),
             dialog_just_opened: false,
             conflict_view: None,
             conflict_doc: None,
@@ -7265,6 +7225,10 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
+
 
 
 

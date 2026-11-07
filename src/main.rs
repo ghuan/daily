@@ -644,6 +644,12 @@ fn build_backend(settings: &Settings) -> Backend {
 /// 侧栏绿点变回「已同步」。
 const PUSH_DELAY: Duration = Duration::from_secs(3);
 
+/// 空闲自动拉取的轮询间隔：另一台电脑推送后，本机最迟这么久自动更新。
+///
+/// sync_round 对「远端无变化」是一次 fetch + 一次 status（本地缓存下秒级完成），
+/// 60 秒一轮不会构成负担，也不会打 Gitee 的频率限制。
+const AUTO_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
 /// 待同步标记（有道云笔记式）。
 ///
 /// 只需要知道「什么时候到期」和「提交说明写什么」；推送内容永远是当时的
@@ -1071,6 +1077,8 @@ struct PlanApp {
     last_tick: Instant,
     /// 上次冲突副本检测时刻（tick 里低频刷新用）。
     last_conflict_scan: Instant,
+    /// 上次空闲自动拉取时刻（每 AUTO_POLL_INTERVAL 一轮）。
+    last_auto_poll: Instant,
     /// 已绘制帧数（首帧创建托盘会拖慢绘制，见 ui() 注释）。
     frames_drawn: u32,
     status: Option<(String, bool, Instant)>,
@@ -1216,6 +1224,7 @@ impl PlanApp {
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),
             last_conflict_scan: Instant::now() - Duration::from_secs(60), // 启动后尽检
+            last_auto_poll: Instant::now(), // 首轮在启动拉取之后 60 秒
             conflict_branches: None,
             conflict_scan_running: false,
             show_conflicts: false,
@@ -1697,6 +1706,23 @@ impl PlanApp {
         {
             self.last_conflict_scan = Instant::now();
             self.refresh_conflict_list();
+        }
+
+        // 定时自动拉取（有道云笔记式「远端变了自动下发」的 git 替代）：
+        // git 没有服务器推送通道，用空闲轮询补上 —— 每 60 秒做一轮 sync_round，
+        // 远端没新内容就是一次廉价 Noop（fetch+status，秒级）；有新内容直接拉下
+        // 来刷界面。另一台电脑推送后，本机最迟 60 秒内自动更新，无需手动点同步。
+        // 防抖队列非空时不轮询：推送本身会带上 pull（sync_round 双向），别抢跑。
+        if !self.syncing
+            && self.settings.kind == Kind::Git
+            && self.push_queue.is_none()
+            && self.last_auto_poll.elapsed() >= AUTO_POLL_INTERVAL
+        {
+            self.last_auto_poll = Instant::now();
+            self.run_due_push("自动拉取".to_string());
+            ctx.request_repaint();
+            // 本轮 tick 结束，等后台回报
+            return;
         }
 
         // 延迟推送队列：到期（入队后满 PUSH_DELAY 且当前空闲）就执行一轮
@@ -5437,6 +5463,7 @@ mod workflow_tests {
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),
             last_conflict_scan: Instant::now() - Duration::from_secs(60), // 启动后尽检
+            last_auto_poll: Instant::now(), // 首轮在启动拉取之后 60 秒
             conflict_branches: None,
             conflict_scan_running: false,
             show_conflicts: false,
@@ -6676,6 +6703,7 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
 
 
 

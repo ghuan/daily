@@ -291,6 +291,9 @@ fn install_theme(ctx: &egui::Context) {
         v.button_frame = true;
         v.interact_cursor = Some(egui::CursorIcon::PointingHand);
         style.visuals = v;
+        // 弹窗零动画：Window 的淡入/滑入有过渡延迟，直接弹出更利落。
+        // animation_time 归零同时作用于 Window/Area 的打开关闭动画。
+        style.animation_time = 0.0;
 
         style.spacing.item_spacing = egui::vec2(8.0, 8.0);
         style.spacing.window_margin = egui::Margin::same(14);
@@ -1055,6 +1058,7 @@ enum DialogKeep {
     DeleteTemplate,
     DeleteRecord,
     Settings,
+    Conflicts,
 }
 
 struct PlanApp {
@@ -1401,6 +1405,7 @@ impl PlanApp {
     }
     /// 打开冲突副本管理：请求清单（缓存里有就直接用），并复位视图状态。
     fn open_conflicts(&mut self) {
+        self.close_all_dialogs_except(DialogKeep::Conflicts);
         self.show_conflicts = true;
         self.conflict_view = None;
         self.conflict_doc = None;
@@ -1835,6 +1840,9 @@ impl PlanApp {
         }
         if keep != DialogKeep::Settings {
             self.show_settings = false;
+        }
+        if keep != DialogKeep::Conflicts {
+            self.show_conflicts = false;
         }
     }
 
@@ -2469,42 +2477,47 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
     } else {
         None
     };
-    let mut just_opened = false;
     if let Some(kind) = clicked {
         // 两个面板互斥：点年份关月份，点月份关年份
         if open && app.ym_picker_mode.as_deref() == Some(kind) {
             open = false;
         } else {
             open = true;
-            just_opened = true; // 打开的当帧跳过「点外部收起」检查，否则会被同一帧的点击立即关掉
             app.ym_picker_mode = Some(kind.to_string());
         }
     }
 
     if open {
         let mode = app.ym_picker_mode.clone().unwrap_or_else(|| "month".into());
+        // 全屏透明拦截层：面板打开时铺在最上层，点任何地方都先落在它上面——
+        // 点到它（=点面板外）就收起。这是「点外部关闭」最可靠的实现，
+        // 不依赖 any_click 的派发细节。拦截层必须在面板之下（先画）。
+        let intercept = egui::Area::new(egui::Id::new("ym_picker_intercept"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(0.0, 0.0))
+            .show(ui.ctx(), |ui| {
+                let screen = ui.max_rect();
+                let (r, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                r
+            });
+        let closed_by_intercept = intercept.response.clicked();
+
         let id = egui::Id::new("ym_picker_popup");
-        let (rect, area_resp) = if mode == "year" {
-            let r = year_btn.rect;
-            let area = show_ym_panel(ui, id, r, |ui| {
+        if mode == "year" {
+            show_ym_panel(ui, id.with("y"), year_btn.rect, |ui| {
                 ym_year_grid(app, ui, selected);
             });
-            (r, area)
         } else {
-            let r = month_btn.rect;
-            let area = show_ym_panel(ui, id, r, |ui| {
+            show_ym_panel(ui, id.with("m"), month_btn.rect, |ui| {
                 ym_month_grid(app, ui, selected);
             });
-            (r, area)
-        };
-        // 点浮层和按钮之外 → 收起。打开的当帧跳过（just_opened），
-        // 否则触发打开的那次点击会被同帧判定为「点了外面」把面板立即关掉。
-        if !just_opened && ui.input(|i| i.pointer.any_click()) {
-            if let Some(p) = ui.input(|i| i.pointer.interact_pos()) {
-                if !area_resp.contains(p) && !rect.contains(p) {
-                    app.ym_picker_open = false;
-                }
-            }
+        }
+        // 面板浮层在拦截层之后创建，自然盖在拦截层上面：面板内的点击落在
+        // 面板控件上，不会触发拦截层的 clicked；点到面板外任何位置都命中
+        // 拦截层 → 收起。
+
+        if closed_by_intercept {
+            app.ym_picker_open = false;
         }
         if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             app.ym_picker_open = false;
@@ -6933,6 +6946,10 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
+
 
 
 

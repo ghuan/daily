@@ -93,7 +93,7 @@ fn last_day_of_month(year: i32, month: u32) -> u32 {
         .unwrap_or(31)
 }
 
-/// 提醒窗口：从「计划时间 - 提前天数」开始，到「计划时间 + 延后天数」结束。
+/// 提醒窗口：从「计划时间 - 提前天数 - 提前分钟数」开始，到「计划时间 + 延后天数」结束。
 ///
 /// 窗口内按 `every_minutes` 反复提醒；`grace_days` 为 `None` 表示一直催到完成为止。
 /// 窗口结束后仍未完成，记录标为「逾期」，不再提醒。
@@ -102,6 +102,14 @@ pub struct RemindWindow {
     /// 提前几天开始提醒（0 = 就在计划当天开始）。
     #[serde(default)]
     pub advance_days: u32,
+    /// 提前多少分钟开始提醒（0 = 不做分钟级提前）。
+    ///
+    /// 与 `advance_days` **叠加**：起点 = 计划时刻 - advance_days 天 - advance_minutes 分钟。
+    /// 天级提前的起点按「那天 0 点」算，分钟级提前在此基础上再往前推；
+    /// 例：计划 11-07 14:00，提前 1 天 + 30 分钟 → 从 11-06 00:00 起（天级生效）；
+    /// 计划 11-07 14:00，提前 0 天 + 30 分钟 → 从 11-07 13:30 起（保留时分）。
+    #[serde(default)]
+    pub advance_minutes: u32,
     /// 延后几天结束提醒；`None` = 不限，一直催到完成。
     #[serde(default)]
     pub grace_days: Option<u32>,
@@ -118,6 +126,7 @@ impl Default for RemindWindow {
     fn default() -> Self {
         Self {
             advance_days: 0,
+            advance_minutes: 0,
             grace_days: None,
             every_minutes: 30,
         }
@@ -126,6 +135,8 @@ impl Default for RemindWindow {
 
 impl RemindWindow {
     pub const MAX_ADVANCE: u32 = 365;
+    /// 分钟级提前的上限（7 天 = 10080 分钟，足够覆盖任何「提前 X 分钟」场景）。
+    pub const MAX_ADVANCE_MINUTES: u32 = 10080;
     pub const MAX_GRACE: u32 = 365;
 
     pub fn validate(self) -> Result<Self, String> {
@@ -477,12 +488,14 @@ impl DayRecord {
 impl RemindWindow {
     /// 计算这条记录的提醒窗口：返回 `(起点, 终点)`，终点为 `None` 表示不限。
     ///
-    /// **起点**：一律取「计划日往前 `advance_days` 天」那一天的 **00:00**，
-    /// **不**保留计划时分。
-    /// - `advance_days == 0` → 计划当天 00:00 起就开始判断。
-    ///   例：计划 11-06 12:00，提前 0 天 → 从 11-06 00:00 起响，
-    ///   不必等到 12:00。
+    /// **起点**：天级部分取「计划日往前 `advance_days` 天」那一天的 **00:00**
+    /// （**不**保留计划时分），分钟级部分再往前推 `advance_minutes` 分钟。
+    /// - `advance_days == 0, advance_minutes == 0` → 计划当天 00:00 起就开始判断。
+    ///   例：计划 11-06 12:00，提前 0 天 0 分 → 从 11-06 00:00 起响，不必等到 12:00。
     /// - `advance_days == 7` → 从 10-30 00:00 起。
+    /// - `advance_days == 0, advance_minutes == 30`，计划 11-07 14:00 → 从 13:30 起。
+    ///   （分钟级提前保留计划时分——「会议前 15 分钟」这类场景。）
+    /// - 两者叠加：起点 = 天级起点再减 advance_minutes。
     ///
     /// **终点** = 计划时刻 + 延后天数；`grace_days == None` 时返回 `None`。
     pub fn window(self, occ: DateTime<Local>) -> Option<(DateTime<Local>, Option<DateTime<Local>>)> {
@@ -495,6 +508,18 @@ impl RemindWindow {
             .single()
             // 夏令时等极端情况下本地时间可能无唯一解，退回整天平移。
             .unwrap_or_else(|| occ - chrono::Duration::days(days));
+        // 分钟级提前：
+        //  - minutes == 0 → 天级行为完全不变（提前 0 天仍从当天 0 点起）
+        //  - minutes > 0, days == 0 → 「计划时刻 - N 分钟」起（保留时分，会前提醒场景）
+        //  - minutes > 0, days > 0 → 天级 0 点之上再往前推（叠加）
+        let minutes = self.advance_minutes.min(Self::MAX_ADVANCE_MINUTES) as i64;
+        let start = if minutes == 0 {
+            start
+        } else if self.advance_days == 0 {
+            occ - chrono::Duration::minutes(minutes)
+        } else {
+            start - chrono::Duration::minutes(minutes)
+        };
         let end = self
             .grace_days
             .map(|g| occ + chrono::Duration::days(g.min(Self::MAX_GRACE) as i64));
@@ -816,6 +841,7 @@ mod tests {
         let mut r = record_at(9, 0, date(2026, 11, 5));
         r.remind = RemindWindow {
             advance_days: 2,
+            advance_minutes: 0,
             grace_days: None,
             every_minutes: 30,
         };
@@ -853,12 +879,14 @@ mod tests {
         let mut a = record_at(12, 0, date(2026, 11, 6));
         a.remind = RemindWindow {
             advance_days: 7,
+            advance_minutes: 0,
             grace_days: None,
             every_minutes: 60,
         };
         let mut b = record_at(23, 0, date(2026, 11, 6));
         b.remind = RemindWindow {
             advance_days: 3,
+            advance_minutes: 0,
             grace_days: Some(6),
             every_minutes: 60,
         };
@@ -893,6 +921,7 @@ mod tests {
         let mut r = record_at(9, 0, date(2026, 11, 5));
         r.remind = RemindWindow {
             advance_days: 0,
+            advance_minutes: 0,
             grace_days: None,
             every_minutes: 60,
         };
@@ -910,6 +939,7 @@ mod tests {
         let mut r = record_at(9, 0, date(2026, 11, 5));
         r.remind = RemindWindow {
             advance_days: 0,
+            advance_minutes: 0,
             grace_days: None,
             every_minutes: 60,
         };
@@ -929,6 +959,7 @@ mod tests {
         let occ = local(2026, 11, 6, 12, 0); // 计划 11/06 12:00
         let w = RemindWindow {
             advance_days: 7,
+            advance_minutes: 0,
             grace_days: None,
             every_minutes: 60,
         };
@@ -954,6 +985,7 @@ mod tests {
         let occ = local(2026, 11, 6, 12, 0);
         let w = RemindWindow {
             advance_days: 0,
+            advance_minutes: 0,
             grace_days: None,
             every_minutes: 60,
         };
@@ -971,6 +1003,7 @@ mod tests {
         let mut r = record_at(9, 0, date(2026, 11, 5));
         r.remind = RemindWindow {
             advance_days: 0,
+            advance_minutes: 0,
             grace_days: Some(0),
             every_minutes: 60,
         };
@@ -993,6 +1026,7 @@ mod tests {
         let mut r = record_at(9, 0, date(2026, 11, 5));
         r.remind = RemindWindow {
             advance_days: 0,
+            advance_minutes: 0,
             grace_days: Some(1),
             every_minutes: 60,
         };
@@ -1013,6 +1047,7 @@ mod tests {
         let mut r = record_at(9, 0, date(2026, 11, 5));
         r.remind = RemindWindow {
             advance_days: 0,
+            advance_minutes: 0,
             grace_days: Some(0),
             every_minutes: 30,
         };
@@ -1061,6 +1096,7 @@ mod tests {
         assert_eq!(
             RemindWindow {
                 advance_days: 3,
+                advance_minutes: 0,
                 grace_days: Some(2),
                 every_minutes: 30,
             }
@@ -1070,6 +1106,7 @@ mod tests {
         assert_eq!(
             RemindWindow {
                 advance_days: 0,
+                advance_minutes: 0,
                 grace_days: Some(0),
                 every_minutes: 30,
             }
@@ -1194,4 +1231,49 @@ mod tests {
     fn time_format_helper() {
         assert_eq!(fmt_time(time(9, 5)), "09:05");
     }
+
+    /// 分钟级提前：起点保留计划时分（会前 N 分钟场景）。
+    #[test]
+    fn advance_minutes_shifts_start_keeping_time() {
+        let rw = RemindWindow {
+            advance_days: 0,
+            advance_minutes: 30,
+            grace_days: Some(0),
+            every_minutes: 15,
+        };
+        let occ = local(2026, 11, 7, 14, 0);
+        let (start, end) = rw.window(occ).unwrap();
+        assert_eq!(start, local(2026, 11, 7, 13, 30), "起点=计划时刻前 30 分钟");
+        assert_eq!(end, Some(local(2026, 11, 7, 14, 0)), "延后 0 天=到点即停");
+    }
+
+    /// 天与分钟叠加：天级起点（0 点）再往前推分钟。
+    #[test]
+    fn advance_days_and_minutes_stack() {
+        let rw = RemindWindow {
+            advance_days: 1,
+            advance_minutes: 45,
+            grace_days: None,
+            every_minutes: 60,
+        };
+        let occ = local(2026, 11, 7, 14, 0);
+        let (start, end) = rw.window(occ).unwrap();
+        // 天级：11-06 00:00；再提前 45 分钟 → 11-05 23:15
+        assert_eq!(start, local(2026, 11, 5, 23, 15));
+        assert_eq!(end, None);
+    }
+
+    /// 旧数据（无 advance_minutes 字段）反序列化后默认 0，行为与从前一致。
+    #[test]
+    fn advance_minutes_defaults_to_zero() {
+        let json = r#"{"advance_days": 2, "grace_days": null, "every_minutes": 30}"#;
+        let rw: RemindWindow = serde_json::from_str(json).unwrap();
+        assert_eq!(rw.advance_minutes, 0);
+        let occ = local(2026, 11, 7, 14, 0);
+        let (start, _) = rw.window(occ).unwrap();
+        assert_eq!(start, local(2026, 11, 5, 0, 0), "纯天级行为不变");
+    }
 }
+
+
+

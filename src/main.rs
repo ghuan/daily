@@ -752,6 +752,8 @@ struct EditState {
     repeat_kind: RepeatKind,
     /// 提前几天开始提醒。
     adv_days: u32,
+    /// 提前多少分钟开始提醒（与 adv_days 叠加）。
+    adv_minutes: u32,
     /// 延后几天结束提醒；`None` = 不限（勾选框未选中）。
     grace_days: Option<u32>,
     /// 窗口内的重响间隔（分钟）。
@@ -788,6 +790,7 @@ impl EditState {
             minute: 0,
             repeat_kind: RepeatKind::Daily,
             adv_days: 0,
+            adv_minutes: 0,
             grace_days: None,
             // 新建默认 1 小时提醒一次：30 分钟对大部分事项太频繁。
             every_minutes: 60,
@@ -855,6 +858,7 @@ impl EditState {
             minute: p.time.minute(),
             repeat_kind,
             adv_days: p.remind.advance_days,
+        adv_minutes: p.remind.advance_minutes,
             grace_days: p.remind.grace_days,
             every_minutes: p.remind.every_minutes,
             weekdays,
@@ -880,6 +884,7 @@ impl EditState {
         state.hour = r.time.hour();
         state.minute = r.time.minute();
         state.adv_days = r.remind.advance_days;
+        state.adv_minutes = r.remind.advance_minutes;
         state.grace_days = r.remind.grace_days;
         state.every_minutes = r.remind.every_minutes;
         state
@@ -913,6 +918,7 @@ impl EditState {
     fn remind(&self) -> Result<RemindWindow, String> {
         RemindWindow {
             advance_days: self.adv_days,
+            advance_minutes: self.adv_minutes,
             grace_days: self.grace_days,
             every_minutes: self.every_minutes,
         }
@@ -973,7 +979,7 @@ fn edit_field_label(ui: &mut egui::Ui, text: &str) {
 
 /// 估算提醒窗口内一共会响多少次，用于给用户一个「这会不会太吵」的提示。
 fn window_fire_count(state: &EditState) -> u32 {
-    let advance_min = state.adv_days.saturating_mul(1440);
+    let advance_min = state.adv_days.saturating_mul(1440).saturating_add(state.adv_minutes);
     let grace_min = state.grace_days.map(|g| g.saturating_mul(1440));
     // 没有延后上限时，只按「提前 + 1 天」估，避免显示无穷大。
     let span = advance_min.saturating_add(grace_min.unwrap_or(1440));
@@ -5116,18 +5122,20 @@ fn ui_edit_dialog(app: &mut PlanApp, ctx: &egui::Context) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
 
-                    // 提前：天数 + 忽略（0 天）两态。
-                    //   忽略（0 天）= 不提前，但**从计划当天 0 点**就开始判断
-                    //   N 天        = 从「计划日往前 N 天」的 0 点开始
-                    // 统一规则：起点永远是那一天的 00:00，不取计划时分。
+                    // 提前：天数 + 分钟数 + 忽略（0 天 0 分）。
+                    //   天数   = 从「计划日往前 N 天」的 0 点开始
+                    //   分钟数 = 在此基础上再往前 N 分钟（保留计划时分）
+                    //   例：计划 14:00，分钟 30 → 13:30 开始响（「会前 30 分钟」场景）
+                    //   天与分钟可叠加：1 天 + 30 分 = 前一天 23:30 起
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("提前").size(12.0).color(theme::TEXT_WEAK));
                         if ui
-                            .add(grace_chip("忽略", state.adv_days == 0))
+                            .add(grace_chip("忽略", state.adv_days == 0 && state.adv_minutes == 0))
                             .on_hover_text("不提前，从计划当天 0 点开始提醒")
                             .clicked()
                         {
                             state.adv_days = 0;
+                            state.adv_minutes = 0;
                         }
                         let mut days = state.adv_days;
                         if ui
@@ -5141,14 +5149,28 @@ fn ui_edit_dialog(app: &mut PlanApp, ctx: &egui::Context) {
                         {
                             state.adv_days = days;
                         }
+                        let mut mins = state.adv_minutes;
+                        let mins_resp = ui.add(
+                            egui::DragValue::new(&mut mins)
+                                .range(0..=RemindWindow::MAX_ADVANCE_MINUTES)
+                                .speed(1)
+                                .suffix(" 分钟"),
+                        );
+                        if mins_resp.changed() {
+                            state.adv_minutes = mins;
+                        }
+                        mins_resp
+                            .on_hover_text("分钟级提前：保留计划时分。例：计划 14:00、提前 30 分钟 → 13:30 开始响");
+                        let hint = match (days, mins) {
+                            (0, 0) => "当天 0 点开始".to_string(),
+                            (d, 0) => format!("{d} 天前的 0 点开始"),
+                            (0, m) => format!("计划时刻前 {m} 分钟开始"),
+                            (d, m) => format!("{d} 天 0 点 再提前 {m} 分钟"),
+                        };
                         ui.label(
-                            RichText::new(if days == 0 {
-                                "当天 0 点开始"
-                            } else {
-                                "天前的 0 点开始"
-                            })
-                            .size(12.0)
-                            .color(theme::TEXT_WEAK),
+                            RichText::new(hint)
+                                .size(12.0)
+                                .color(theme::TEXT_WEAK),
                         );
                     });
                     ui.add_space(4.0);
@@ -6930,6 +6952,7 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
 
 
 

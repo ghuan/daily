@@ -3068,7 +3068,7 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                 egui::Frame::NONE
                     .fill(theme::SIDEBAR_HOVER)
                     .corner_radius(egui::CornerRadius::same(10))
-                    .inner_margin(egui::Margin::symmetric(11, 9))
+                    .inner_margin(egui::Margin::symmetric(11, 7))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.horizontal(|ui| {
@@ -3150,7 +3150,7 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                         .fill(theme::SIDEBAR_HOVER)
                         .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(48, 58, 87)))
                         .corner_radius(egui::CornerRadius::same(10))
-                        .min_size(egui::vec2(ui.available_width(), 36.0)),
+                        .min_size(egui::vec2(ui.available_width(), 30.0)),
                     )
                     .clicked()
                 {
@@ -4487,12 +4487,12 @@ fn nav_item(ui: &mut egui::Ui, icon: &str, text: &str, active: bool) -> egui::Re
     let resp = egui::Frame::NONE
         .fill(fill)
         .corner_radius(egui::CornerRadius::same(9))
-        .inner_margin(egui::Margin::symmetric(11, 8))
+        .inner_margin(egui::Margin::symmetric(11, 7))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(icon).size(15.0).color(fg));
-                ui.add_space(5.0);
+                ui.label(RichText::new(icon).size(14.0).color(fg));
+                ui.add_space(4.0);
                 ui.label(RichText::new(text).size(13.0).strong().color(fg));
             });
         })
@@ -7276,6 +7276,8 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
 
 
 

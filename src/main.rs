@@ -1137,6 +1137,8 @@ struct PlanApp {
     stats_filter: u8,
     /// 统计页：当前页码。
     stats_page: usize,
+    /// 统计页：每页条数。
+    stats_per_page: usize,
     /// 统计页：基准日期选择器的翻月状态。
     stats_cal_month: NaiveDate,
     /// 弹窗刚被打开的帧标记：这一帧的点击是「打开动作本身」，
@@ -1280,6 +1282,7 @@ impl PlanApp {
             stats_scope: StatsScope::Month,
             stats_filter: 0,
             stats_page: 0,
+            stats_per_page: 20,
             stats_cal_month: Local::now().date_naive(),
             dialog_just_opened: false,
             conflict_view: None,
@@ -3139,7 +3142,7 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                         app.open_conflicts();
                     }
                 }
-                ui.add_space(4.0);
+                ui.add_space(2.0);
                 if ui
                     .add(
                         egui::Button::new(
@@ -4263,7 +4266,7 @@ fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
             );
             ui.add_space(8.0);
 
-            // ---- 过滤 ----
+            // ---- 过滤 + 每页条数 + 分页（查询工具条） ----
             ui.horizontal(|ui| {
                 ui.label(RichText::new("显示").size(12.0).color(theme::TEXT_WEAK));
                 let mut chip = |name: &str, val: u8| -> egui::Response {
@@ -4287,13 +4290,24 @@ fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                 if chip("未完成", 2).clicked() {
                     app.stats_filter = 2;
                 }
+                ui.add_space(10.0);
+                ui.label(RichText::new("每页").size(12.0).color(theme::TEXT_WEAK));
+                // 每页条数下拉（10/20/50/100）
+                let per_page = app.stats_per_page;
+                let pages = shown.len().div_ceil(per_page).max(1);
+                if app.stats_page >= pages {
+                    app.stats_page = pages - 1;
+                }
+                egui::ComboBox::from_id_salt("stats-per-page")
+                    .selected_text(format!("{} 条/页", per_page))
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        for n in [10usize, 20, 50, 100] {
+                            ui.selectable_value(&mut app.stats_per_page, n, format!("{} 条/页", n));
+                        }
+                    });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // 分页：上一页 / 下一页
-                    let per_page = 20usize;
-                    let pages = shown.len().div_ceil(per_page).max(1);
-                    if app.stats_page >= pages {
-                        app.stats_page = pages - 1;
-                    }
                     if ui.add(button_mini("‹ 上一页")).clicked() && app.stats_page > 0 {
                         app.stats_page -= 1;
                     }
@@ -4309,63 +4323,198 @@ fn ui_stats_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
             });
             ui.add_space(8.0);
 
-            // ---- 明细分页列表 ----
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                let per_page = 20usize;
-                let skip = app.stats_page * per_page;
-                let page_items: Vec<&DayRecord> =
-                    shown.iter().skip(skip).take(per_page).copied().collect();
-                if page_items.is_empty() {
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new("这个范围内没有记录")
-                            .size(13.0)
-                            .color(theme::TEXT_WEAK),
-                    );
-                } else {
-                    for r in page_items {
-                        ui.horizontal(|ui| {
-                            let state_icon = if r.done { "✓" } else { "○" };
-                            let state_color = if r.done { theme::OK } else { theme::TEXT_WEAK };
-                            ui.label(
-                                RichText::new(state_icon)
-                                    .size(14.0)
-                                    .strong()
-                                    .color(state_color),
-                            );
-                            ui.label(
-                                RichText::new(format!("{}", r.date.format("%m-%d")))
-                                    .size(12.5)
-                                    .color(theme::TEXT_WEAK),
-                            );
-                            ui.label(
-                                RichText::new(&r.title)
-                                    .size(13.0)
-                                    .strong()
-                                    .color(theme::TEXT),
-                            );
-                            if !r.tag.is_empty() {
-                                tag_badge_light(ui, &r.tag);
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if let Some(t) = r.done_at {
-                                    ui.label(
-                                        RichText::new(format!("完成于 {}", t.format("%m-%d %H:%M")))
-                                            .size(11.0)
-                                            .color(theme::TEXT_WEAK),
-                                    );
-                                } else {
-                                    ui.label(
-                                        RichText::new(fmt_time(r.time))
-                                            .size(11.0)
-                                            .color(theme::TEXT_WEAK),
+            // ---- 表格列表（表头 + 行分隔） ----
+            let header_color = Color32::from_rgb(90, 100, 122);
+            let header_bg = Color32::from_rgb(246, 247, 251);
+            egui::Frame::NONE
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                .corner_radius(egui::CornerRadius::same(10))
+                .show(ui, |ui| {
+                    // 表头
+                    egui::Frame::NONE
+                        .fill(header_bg)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let width = ui.available_width();
+                                for (text, frac) in [
+                                    ("状态", 0.08),
+                                    ("日期", 0.12),
+                                    ("标题", 0.34),
+                                    ("标签", 0.16),
+                                ] {
+                                    ui.allocate_ui_with_layout(
+                                        egui::vec2(width * frac, 20.0),
+                                        Layout::left_to_right(Align::Center),
+                                        |ui| {
+                                            ui.label(
+                                                RichText::new(text)
+                                                    .size(11.5)
+                                                    .color(header_color),
+                                            );
+                                        },
                                     );
                                 }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    ui.label(
+                                        RichText::new("时间")
+                                            .size(11.5)
+                                            .color(header_color),
+                                    );
+                                });
                             });
                         });
-                        ui.add_space(3.0);
+                    ui.separator();
+
+                    // 数据行（分页）
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(460.0)
+                        .show(ui, |ui| {
+                            let per_page = app.stats_per_page;
+                            let skip = app.stats_page * per_page;
+                            let page_items: Vec<&DayRecord> =
+                                shown.iter().skip(skip).take(per_page).copied().collect();
+                            if page_items.is_empty() {
+                                ui.add_space(12.0);
+                                ui.label(
+                                    RichText::new("这个范围内没有记录")
+                                        .size(13.0)
+                                        .color(theme::TEXT_WEAK),
+                                );
+                            } else {
+                                for (i, r) in page_items.iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.set_width(ui.available_width());
+                                        // 斑马纹：偶数行浅底
+                                        let row_fill = if i % 2 == 1 {
+                                            Color32::from_rgb(248, 249, 252)
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        };
+                                        let row_min = ui.min_rect();
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(
+                                                row_min.left_top(),
+                                                egui::vec2(ui.available_width(), 30.0),
+                                            ),
+                                            0.0,
+                                            row_fill,
+                                        );
+                                        let state_icon = if r.done { "✓" } else { "○" };
+                                        let state_color = if r.done { theme::OK } else { theme::TEXT_WEAK };
+                                        // 状态
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(ui.available_width() * 0.08, 26.0),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(state_icon)
+                                                        .size(14.0)
+                                                        .strong()
+                                                        .color(state_color),
+                                                );
+                                            },
+                                        );
+                                        // 日期
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(ui.available_width() * 0.12, 26.0),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(format!("{}", r.date.format("%m-%d")))
+                                                        .size(12.5)
+                                                        .color(theme::TEXT),
+                                                );
+                                            },
+                                        );
+                                        // 标题
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(ui.available_width() * 0.34, 26.0),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(&r.title)
+                                                        .size(12.5)
+                                                        .color(theme::TEXT),
+                                                );
+                                            },
+                                        );
+                                        // 标签
+                                        ui.allocate_ui_with_layout(
+                                            egui::vec2(ui.available_width() * 0.16, 26.0),
+                                            Layout::left_to_right(Align::Center),
+                                            |ui| {
+                                                if !r.tag.is_empty() {
+                                                    tag_badge_light(ui, &r.tag);
+                                                }
+                                            },
+                                        );
+                                        // 时间（右对齐）
+                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                            if let Some(t) = r.done_at {
+                                                ui.label(
+                                                    RichText::new(format!("{}", t.format("%m-%d %H:%M")))
+                                                        .size(11.5)
+                                                        .color(theme::TEXT_WEAK),
+                                                );
+                                            } else {
+                                                ui.label(
+                                                    RichText::new(fmt_time(r.time))
+                                                        .size(11.5)
+                                                        .color(theme::TEXT_WEAK),
+                                                );
+                                            }
+                                        });
+                                    });
+                                    ui.separator();
+                                }
+                            }
+                        });
+                });
+
+            // ---- 底部统计行（表格查询样式：左统计 右分页） ----
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(format!(
+                        "当前共 {} 条，其中 已完成 {} 条，未完成 {} 条",
+                        total, done, undone
+                    ))
+                    .size(11.5)
+                    .color(theme::TEXT_WEAK),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let per_page = app.stats_per_page;
+                    let pages = shown.len().div_ceil(per_page).max(1);
+                    if app.stats_page >= pages {
+                        app.stats_page = pages - 1;
                     }
-                }
+                    if ui.add(button_mini("‹ 上一页")).clicked() && app.stats_page > 0 {
+                        app.stats_page -= 1;
+                    }
+                    // 页码按钮
+                    for p in 0..pages.min(7) {
+                        let cur = app.stats_page == p;
+                        let btn = egui::Button::new(
+                            RichText::new(format!("{}", p + 1))
+                                .size(11.5)
+                                .strong()
+                                .color(if cur { Color32::WHITE } else { theme::TEXT }),
+                        )
+                        .fill(if cur { theme::ACCENT } else { theme::CARD })
+                        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+                        .corner_radius(egui::CornerRadius::same(6))
+                        .min_size(egui::vec2(26.0, 24.0));
+                        if ui.add(btn).clicked() {
+                            app.stats_page = p;
+                        }
+                    }
+                    if ui.add(button_mini("下一页 ›")).clicked() && app.stats_page + 1 < pages {
+                        app.stats_page += 1;
+                    }
+                });
             });
         });
 }
@@ -4480,7 +4629,7 @@ fn nav_item(ui: &mut egui::Ui, icon: &str, text: &str, active: bool) -> egui::Re
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.label(RichText::new(icon).size(13.0).color(fg));
+                ui.label(RichText::new(icon).size(16.0).color(fg));
                 ui.add_space(4.0);
                 ui.label(RichText::new(text).size(13.0).strong().color(fg));
             });
@@ -6016,6 +6165,7 @@ mod workflow_tests {
             stats_scope: StatsScope::Month,
             stats_filter: 0,
             stats_page: 0,
+            stats_per_page: 20,
             stats_cal_month: Local::now().date_naive(),
             dialog_just_opened: false,
             conflict_view: None,
@@ -7265,6 +7415,11 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
+
+
 
 
 

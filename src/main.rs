@@ -3203,40 +3203,46 @@ fn ui_sidebar(app: &mut PlanApp, root: &mut egui::Ui) {
                     .inner_margin(egui::Margin::symmetric(11, 7))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            let (dot, _) =
-                                ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                            ui.painter().circle_filled(
-                                dot.center(),
-                                3.5,
-                                if app.syncing { theme::WARN } else { theme::OK },
-                            );
+                        // 显式 top_down：Frame 会继承外层的 bottom_up，导致
+                        // 预留高度虚增、与上方按钮的间隙不可控（实测 18px）。
+                        // 视觉顺序不变：详情在上、Git 同步在下。
+                        ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
                             ui.label(
-                                RichText::new(if app.syncing {
-                                    "正在同步"
-                                } else if app.push_queue.is_some() {
-                                    "待推送"
+                                RichText::new(if app.push_queue.is_some() && !app.syncing {
+                                    format!("改动已暂存，{}后同步", remaining_str(app))
                                 } else {
-                                    mode
+                                    detail.to_string()
                                 })
-                                .size(11.5)
-                                .strong()
-                                .color(Color32::from_rgb(219, 225, 242)),
+                                .size(9.5)
+                                .color(Color32::from_rgb(126, 139, 168)),
                             );
+                            ui.horizontal(|ui| {
+                                let (dot, _) = ui
+                                    .allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
+                                ui.painter().circle_filled(
+                                    dot.center(),
+                                    3.5,
+                                    if app.syncing { theme::WARN } else { theme::OK },
+                                );
+                                ui.label(
+                                    RichText::new(if app.syncing {
+                                        "正在同步"
+                                    } else if app.push_queue.is_some() {
+                                        "待推送"
+                                    } else {
+                                        mode
+                                    })
+                                    .size(11.5)
+                                    .strong()
+                                    .color(Color32::from_rgb(219, 225, 242)),
+                                );
+                            });
                         });
-                        ui.label(
-                            RichText::new(if app.push_queue.is_some() && !app.syncing {
-                                format!("改动已暂存，{}后同步", remaining_str(app))
-                            } else {
-                                detail.to_string()
-                            })
-                            .size(9.5)
-                            .color(Color32::from_rgb(126, 139, 168)),
-                        );
                     });
                 // 冲突副本入口：有副本时醒目（琥珀色），没有时弱化（仅 Git 模式显示）
-                // （bottom_up 布局：这里的 space 落在冲突副本按钮与上方同步状态块之间）
-                ui.add_space(4.0);
+                // （bottom_up 布局：Frame 在此布局下顶部会多出 ~3px 预留，
+                //  实测校准用 1px，使与「设置与存储」的间隙一致）
+                ui.add_space(1.0);
                 if app.settings.kind == Kind::Git {
                     let count = app
                         .conflict_branches

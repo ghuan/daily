@@ -2534,7 +2534,7 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
     // 年份面板。Popup::new + open_bool 纯绑定：外点关闭 / Esc 由 Popup 内置
     // （CloseOnClickOutside），状态通过 open_bool 双向同步。
     let mut year_open = year_open;
-    let year_popup = egui::Popup::new(egui::Id::new("ym_year_popup"), ui.ctx().clone(), year_btn.rect, year_btn.layer_id)
+    let _year_popup = egui::Popup::new(egui::Id::new("ym_year_popup"), ui.ctx().clone(), year_btn.rect, year_btn.layer_id)
         .open_bool(&mut year_open)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .width(300.0)
@@ -2550,7 +2550,7 @@ fn year_month_picker(app: &mut PlanApp, ui: &mut egui::Ui, selected: NaiveDate) 
         });
     // 月份面板
     let mut month_open = month_open;
-    let month_popup = egui::Popup::new(egui::Id::new("ym_month_popup"), ui.ctx().clone(), month_btn.rect, month_btn.layer_id)
+    let _month_popup = egui::Popup::new(egui::Id::new("ym_month_popup"), ui.ctx().clone(), month_btn.rect, month_btn.layer_id)
         .open_bool(&mut month_open)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .width(300.0)
@@ -2671,12 +2671,94 @@ fn month_grid(
             *cal_month = shift_month(*cal_month, -1);
         }
         ui.add_space(2.0);
-        ui.label(
-            RichText::new(format!("{} 年 {} 月", cal_month.year(), cal_month.month()))
-                .size(12.5)
-                .strong()
-                .color(theme::TEXT),
-        );
+        // 年、月文字可点：点击弹上下文菜单快速选年/选月（不用一格一格翻）
+        let year_resp = ui
+            .add(
+                egui::Button::new(
+                    RichText::new(format!("{} 年", cal_month.year()))
+                        .size(12.5)
+                        .strong()
+                        .color(theme::TEXT),
+                )
+                .fill(Color32::TRANSPARENT)
+                .corner_radius(egui::CornerRadius::same(5)),
+            )
+            .on_hover_text("点击快速选择年份");
+        let month_resp = ui
+            .add(
+                egui::Button::new(
+                    RichText::new(format!("{} 月", cal_month.month()))
+                        .size(12.5)
+                        .strong()
+                        .color(theme::TEXT),
+                )
+                .fill(Color32::TRANSPARENT)
+                .corner_radius(egui::CornerRadius::same(5)),
+            )
+            .on_hover_text("点击快速选择月份");
+        // 年、月文字可点：右键/左键点击弹快捷菜单选年/选月（不用一格一格翻）
+        let year_resp = ui
+            .add(
+                egui::Button::new(
+                    RichText::new(format!("{} 年", cal_month.year()))
+                        .size(12.5)
+                        .strong()
+                        .color(theme::TEXT),
+                )
+                .fill(Color32::TRANSPARENT)
+                .corner_radius(egui::CornerRadius::same(5)),
+            )
+            .on_hover_text("点击快速选择年份");
+        year_resp.context_menu(|ui| {
+            ui.set_width(160.0);
+            ui.label(RichText::new("选择年份").size(11.0).color(theme::TEXT_WEAK));
+            let cur = cal_month.year();
+            for y in (cur - 6)..=(cur + 6) {
+                if ui.selectable_label(y == cur, format!("{} 年", y)).clicked() {
+                    // 保持日不变（月底溢出时 clamp）
+                    let d = cal_month.day();
+                    let last = last_of_month(
+                        NaiveDate::from_ymd_opt(y, cal_month.month(), 1)
+                            .unwrap_or(*cal_month),
+                    )
+                    .day();
+                    *cal_month =
+                        NaiveDate::from_ymd_opt(y, cal_month.month(), d.min(last))
+                            .unwrap_or(*cal_month);
+                    ui.close();
+                }
+            }
+        });
+        let month_resp = ui
+            .add(
+                egui::Button::new(
+                    RichText::new(format!("{} 月", cal_month.month()))
+                        .size(12.5)
+                        .strong()
+                        .color(theme::TEXT),
+                )
+                .fill(Color32::TRANSPARENT)
+                .corner_radius(egui::CornerRadius::same(5)),
+            )
+            .on_hover_text("点击快速选择月份");
+        month_resp.context_menu(|ui| {
+            ui.set_width(120.0);
+            ui.label(RichText::new("选择月份").size(11.0).color(theme::TEXT_WEAK));
+            for m in 1..=12u32 {
+                if ui.selectable_label(m == cal_month.month(), format!("{} 月", m)).clicked() {
+                    let d = cal_month.day();
+                    let last = last_of_month(
+                        NaiveDate::from_ymd_opt(cal_month.year(), m, 1)
+                            .unwrap_or(*cal_month),
+                    )
+                    .day();
+                    *cal_month =
+                        NaiveDate::from_ymd_opt(cal_month.year(), m, d.min(last))
+                            .unwrap_or(*cal_month);
+                    ui.close();
+                }
+            }
+        });
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.add(button_mini("›")).clicked() {
                 *cal_month = shift_month(*cal_month, 1);
@@ -7225,6 +7307,9 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     }
     ctx.request_repaint();
 }
+
+
+
 
 
 

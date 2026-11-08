@@ -186,8 +186,8 @@ fn install_tray_event_handlers(ctx: &egui::Context) {
                 QUIT_REQUESTED.store(true, Ordering::SeqCst);
                 menu_ctx.request_repaint();
                 std::thread::spawn(|| {
-                    // 给 UI 线程 250ms 走优雅路径（drop 托盘 + Close）。
-                    std::thread::sleep(Duration::from_millis(250));
+                    // 给 UI 线程 100ms 走优雅路径（drop 托盘 + Close）。
+                    std::thread::sleep(Duration::from_millis(100));
                     remove_tray_icon_now();
                     std::thread::sleep(Duration::from_millis(80));
                     std::process::exit(0);
@@ -215,29 +215,6 @@ fn request_ui_wake() {
 
 /// 清掉进程被强杀时残留在通知区的托盘图标。
 ///
-/// 托盘图标由 Explorer 的 Shell_NotifyIcon 管理，进程没发 NIM_DELETE 就退出时，
-/// 图标会留在通知区成"僵尸"，要鼠标划过才消失。标准的补救办法是向所有顶层窗口
-/// 广播 `TaskbarCreated`（`Shell_NotifyIcon` 的重新注册消息），Explorer 会重建
-/// 通知区、丢弃没有对应进程的图标。
-fn clear_zombie_tray_icons() {
-    #[cfg(windows)]
-    unsafe {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{
-            RegisterWindowMessageW, SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG,
-        };
-
-        let msg = RegisterWindowMessageW(windows_sys::w!("TaskbarCreated"));
-        if msg == 0 {
-            return;
-        }
-        let mut result: usize = 0;
-        SendMessageTimeoutW(HWND_BROADCAST, msg, 0, 0, SMTO_ABORTIFHUNG, 200, &mut result);
-    }
-}
-
-#[cfg(not(windows))]
-fn clear_zombie_tray_icons() {}
-
 /// 立即把托盘图标从通知区删掉。
 ///
 /// 用于 `process::exit` 之前的兜底：那条路径不跑 `TrayIcon::drop()`，
@@ -294,7 +271,6 @@ fn remove_tray_icon_now() {
             }
         }
     }
-    clear_zombie_tray_icons();
 }
 
 #[cfg(not(windows))]

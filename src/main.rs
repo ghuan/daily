@@ -180,18 +180,16 @@ fn install_tray_event_handlers(ctx: &egui::Context) {
             MENU_OPEN => Some(TrayAction::Open),
             MENU_AUTOSTART => Some(TrayAction::ToggleAutostart),
             MENU_QUIT => {
-                // 退出：置标志 + 唤醒 UI 走正常关闭（会 drop 托盘图标 → NIM_DELETE）。
-                // 但窗口**最小化**时 winit 不再派发 RedrawRequested，eframe 的
-                // update() 停摆，标志没人消费 —— 用户看到「点退出没反应，得再点
-                // 一下托盘图标把窗口唤醒才退」。所以这里再加一个看门狗线程：
-                // 超时后先广播 TaskbarCreated 清掉僵尸托盘图标，再强制退出。
-                // 数据是逐次落盘的，强退不丢已保存的改动。
+                // 退出。注意 process::exit 不会跑析构，TrayIcon::drop() 里的
+                // Shell_NotifyIcon(NIM_DELETE) 就不会执行 —— 托盘图标会残留。
+                // 所以强制退出前必须自己调 remove_tray_icon_now() 先把图标删掉。
                 QUIT_REQUESTED.store(true, Ordering::SeqCst);
                 menu_ctx.request_repaint();
                 std::thread::spawn(|| {
-                    std::thread::sleep(Duration::from_millis(700));
-                    // 走到这里说明 UI 线程没在 700ms 内处理（窗口最小化）。
-                    clear_zombie_tray_icons();
+                    // 给 UI 线程 250ms 走优雅路径（drop 托盘 + Close）。
+                    std::thread::sleep(Duration::from_millis(250));
+                    remove_tray_icon_now();
+                    std::thread::sleep(Duration::from_millis(80));
                     std::process::exit(0);
                 });
                 None
@@ -225,37 +223,82 @@ fn clear_zombie_tray_icons() {
     #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            EnumWindows, GetWindowTextW, IsWindowVisible, SendMessageTimeoutW, HWND_BROADCAST,
-            SMTO_ABORTIFHUNG,
+            RegisterWindowMessageW, SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG,
         };
 
-        windows_sys::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(
-            windows_sys::w!("TaskbarCreated"),
-        );
-        let msg = windows_sys::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(
-            windows_sys::w!("TaskbarCreated"),
-        );
+        let msg = RegisterWindowMessageW(windows_sys::w!("TaskbarCreated"));
         if msg == 0 {
             return;
         }
-        // 广播即可：Explorer 收到后会重建通知区，清掉无主图标。
         let mut result: usize = 0;
-        SendMessageTimeoutW(
-            HWND_BROADCAST,
-            msg,
-            0,
-            0,
-            SMTO_ABORTIFHUNG,
-            200,
-            &mut result,
-        );
-        // 下面两个符号只为让编译器确认导入可用（不同 Windows 版本走不同分支）。
-        let _ = (EnumWindows, GetWindowTextW, IsWindowVisible);
+        SendMessageTimeoutW(HWND_BROADCAST, msg, 0, 0, SMTO_ABORTIFHUNG, 200, &mut result);
     }
 }
 
 #[cfg(not(windows))]
 fn clear_zombie_tray_icons() {}
+
+/// 立即把托盘图标从通知区删掉。
+///
+/// 用于 `process::exit` 之前的兜底：那条路径不跑 `TrayIcon::drop()`，
+/// 而 NIM_DELETE 正是在 drop 里发的，不补一次图标就会残留成僵尸
+/// （用户看到的「程序退了但图标还在」）。
+///
+/// 实现：枚举本进程里所有 `tray_icon_app` 类窗口（tray-icon 为每个托盘图标
+/// 建一个隐藏窗口），对每个窗口按 uID 1..=16 发 NIM_DELETE。
+#[cfg(windows)]
+fn remove_tray_icon_now() {
+    use windows_sys::Win32::UI::Shell::{
+        Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_DELETE, NOTIFYICONDATAW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId,
+    };
+
+    static CANDIDATES: std::sync::Mutex<Vec<isize>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut v) = CANDIDATES.lock() {
+        v.clear();
+    }
+
+    unsafe extern "system" fn collect(hwnd: *mut std::ffi::c_void, lparam: isize) -> i32 {
+        let mut pid: u32 = 0;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if pid as isize != lparam {
+            return 1;
+        }
+        let mut buf = [0u16; 64];
+        let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        if n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "tray_icon_app" {
+            if let Ok(mut v) = CANDIDATES.lock() {
+                v.push(hwnd as isize);
+            }
+        }
+        1
+    }
+
+    unsafe {
+        EnumWindows(Some(collect), std::process::id() as isize);
+    }
+
+    let candidates: Vec<isize> = CANDIDATES.lock().map(|v| v.clone()).unwrap_or_default();
+    for raw in candidates {
+        let hwnd = raw as *mut std::ffi::c_void;
+        for uid in 1..=16u32 {
+            let mut nid: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+            nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = hwnd;
+            nid.uID = uid;
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+            unsafe {
+                Shell_NotifyIconW(NIM_DELETE, &mut nid);
+            }
+        }
+    }
+    clear_zombie_tray_icons();
+}
+
+#[cfg(not(windows))]
+fn remove_tray_icon_now() {}
 
 // ============================== 配色 ==============================
 
@@ -2231,14 +2274,21 @@ impl eframe::App for PlanApp {
             force_light_titlebar();
         }
         self.handle_tray_events(ctx);
+        // 每帧记一次心跳（只在前 3 次与退出请求后的帧写，避免日志膨胀）
+        if QUIT_REQUESTED.load(Ordering::SeqCst) {
+        }
         // 托盘「退出」：先显式 drop 托盘图标（Drop 里会发 NIM_DELETE，
         // 图标立刻从通知区消失；不 drop 的话进程退出后图标会残留成僵尸，
         // 要等鼠标划过通知区才消失——就是用户反馈的现象）。
         // 然后走正常关闭流程让 eframe 退出事件循环。
         if QUIT_REQUESTED.load(Ordering::SeqCst) && !self.quitting {
             self.quitting = true;
+            // 先 drop 托盘（走 TrayIcon::drop 的 NIM_DELETE），
+            // 再补一次显式删除：Drop 里的删除偶尔会被 Explorer 忽略，
+            // 导致图标残留到鼠标划过才消失。
             self.tray = None;
             self.tray_autostart_item = None;
+            remove_tray_icon_now();
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
         self.poll_sync();

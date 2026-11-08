@@ -9,6 +9,7 @@ mod model;
 mod notify;
 mod store;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -139,11 +140,13 @@ fn request_show_from_other_instance() {
 /// 即使主窗口已隐藏也不依赖系统重绘或轮询，避免事件积压。
 static UI_CONTEXT: OnceLock<Mutex<Option<egui::Context>>> = OnceLock::new();
 static TRAY_EVENTS: OnceLock<Mutex<Vec<TrayAction>>> = OnceLock::new();
+/// 托盘「退出」置位：UI 线程看到就正常走关闭流程。最小化时可能没人处理，
+/// 所以回调里还会起一个兜底线程，超时直接结束进程。
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 enum TrayAction {
     Open,
     ToggleAutostart,
-    Quit,
 }
 
 fn install_tray_event_handlers(ctx: &egui::Context) {
@@ -176,7 +179,23 @@ fn install_tray_event_handlers(ctx: &egui::Context) {
         let action = match event.id.0.as_str() {
             MENU_OPEN => Some(TrayAction::Open),
             MENU_AUTOSTART => Some(TrayAction::ToggleAutostart),
-            MENU_QUIT => Some(TrayAction::Quit),
+            MENU_QUIT => {
+                // 退出：置标志 + 唤醒 UI 走正常关闭（会 drop 托盘图标 → NIM_DELETE）。
+                // 但窗口**最小化**时 winit 不再派发 RedrawRequested，eframe 的
+                // update() 停摆，标志没人消费 —— 用户看到「点退出没反应，得再点
+                // 一下托盘图标把窗口唤醒才退」。所以这里再加一个看门狗线程：
+                // 超时后先广播 TaskbarCreated 清掉僵尸托盘图标，再强制退出。
+                // 数据是逐次落盘的，强退不丢已保存的改动。
+                QUIT_REQUESTED.store(true, Ordering::SeqCst);
+                menu_ctx.request_repaint();
+                std::thread::spawn(|| {
+                    std::thread::sleep(Duration::from_millis(700));
+                    // 走到这里说明 UI 线程没在 700ms 内处理（窗口最小化）。
+                    clear_zombie_tray_icons();
+                    std::process::exit(0);
+                });
+                None
+            }
             _ => None,
         };
         if let Some(action) = action {
@@ -195,6 +214,48 @@ fn request_ui_wake() {
         }
     }
 }
+
+/// 清掉进程被强杀时残留在通知区的托盘图标。
+///
+/// 托盘图标由 Explorer 的 Shell_NotifyIcon 管理，进程没发 NIM_DELETE 就退出时，
+/// 图标会留在通知区成"僵尸"，要鼠标划过才消失。标准的补救办法是向所有顶层窗口
+/// 广播 `TaskbarCreated`（`Shell_NotifyIcon` 的重新注册消息），Explorer 会重建
+/// 通知区、丢弃没有对应进程的图标。
+fn clear_zombie_tray_icons() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            EnumWindows, GetWindowTextW, IsWindowVisible, SendMessageTimeoutW, HWND_BROADCAST,
+            SMTO_ABORTIFHUNG,
+        };
+
+        windows_sys::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(
+            windows_sys::w!("TaskbarCreated"),
+        );
+        let msg = windows_sys::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW(
+            windows_sys::w!("TaskbarCreated"),
+        );
+        if msg == 0 {
+            return;
+        }
+        // 广播即可：Explorer 收到后会重建通知区，清掉无主图标。
+        let mut result: usize = 0;
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            msg,
+            0,
+            0,
+            SMTO_ABORTIFHUNG,
+            200,
+            &mut result,
+        );
+        // 下面两个符号只为让编译器确认导入可用（不同 Windows 版本走不同分支）。
+        let _ = (EnumWindows, GetWindowTextW, IsWindowVisible);
+    }
+}
+
+#[cfg(not(windows))]
+fn clear_zombie_tray_icons() {}
 
 // ============================== 配色 ==============================
 
@@ -1684,11 +1745,6 @@ impl PlanApp {
                     let on = !self.settings.autostart;
                     self.set_autostart(on);
                 }
-                TrayAction::Quit => {
-                    // 托盘回调已主动唤醒 UI；这里走正常关闭流程，释放托盘与进程。
-                    self.quitting = true;
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
-                }
             }
         }
     }
@@ -2175,6 +2231,16 @@ impl eframe::App for PlanApp {
             force_light_titlebar();
         }
         self.handle_tray_events(ctx);
+        // 托盘「退出」：先显式 drop 托盘图标（Drop 里会发 NIM_DELETE，
+        // 图标立刻从通知区消失；不 drop 的话进程退出后图标会残留成僵尸，
+        // 要等鼠标划过通知区才消失——就是用户反馈的现象）。
+        // 然后走正常关闭流程让 eframe 退出事件循环。
+        if QUIT_REQUESTED.load(Ordering::SeqCst) && !self.quitting {
+            self.quitting = true;
+            self.tray = None;
+            self.tray_autostart_item = None;
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
         self.poll_sync();
 
         // 关闭按钮 → 隐藏到托盘；只有托盘「退出」才允许真正关闭。

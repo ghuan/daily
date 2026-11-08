@@ -1519,7 +1519,11 @@ impl PlanApp {
                                 let backend = build_backend(&self.settings);
                                 if let Ok(doc) = backend.load() {
                                     self.doc = doc;
-                                    self.popups.clear();
+                                    // 注意：**不要**清空 self.popups。
+                                    // 弹窗有自己的生命周期（tick() 里按 in_reminder_window
+                                    // 判定是否过期），而记录 Uuid 在同步前后保持稳定，
+                                    // 重载 doc 不影响正在显示的提醒。曾经在这里 clear()
+                                    // 导致每轮自动同步（60 秒）都把提醒窗口关掉。
                                     // 立刻重绘，别等下一次 1 秒 tick —— 用户点「立即同步」
                                     // 后要马上看到卡片状态变化（勾变绿）。
                                     request_ui_wake();

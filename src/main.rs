@@ -412,6 +412,11 @@ fn main() -> eframe::Result<()> {
     let _ = font_cache();
 
     let icon = load_icon_data();
+    // 修复被写坏的历史窗口尺寸：eframe 的 persist_window 会把上次的
+    // normal_geometry 存进 app.ron。若某次窗口被缩到极小（曾出现 64×64），
+    // 之后每次启动都恢复成那个尺寸 —— 用户看到的就是「一打开窗口就这么点」。
+    // 这里在建窗前读一遍，把明显不合理的小尺寸剔除，让 with_inner_size 生效。
+    sanitize_persisted_window_size();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_TITLE)
@@ -431,6 +436,63 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(PlanApp::new(cc)))),
     )
+}
+
+/// 修复被写坏的持久化窗口尺寸。
+///
+/// eframe 的 `persist_window: true` 会把窗口的 `normal_geometry`（含
+/// `inner_size_points`）写进 `%APPDATA%\bell-reminder\data\app.ron`，下次启动照抄。
+/// 一旦某次窗口被缩到极小（实测出现过 64×64），之后**每次打开都只有那么点大**，
+/// 且 `with_inner_size` 会被这个持久化值覆盖。
+///
+/// 这里在 eframe 读状态文件之前把它清掉：只删 `window:` 那一行，
+/// 其余状态（egui 的内存、各 Area 位置等）保留，不影响其他功能。
+fn sanitize_persisted_window_size() {
+    let Some(dir) = dirs_app_data() else {
+        return;
+    };
+    let path = dir.join("data").join("app.ron");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+
+    // 找 "window": "..." 这一行，解析出 inner_size_points 的宽高。
+    let Some(line) = text.lines().find(|l| l.trim_start().starts_with("\"window\"")) else {
+        return;
+    };
+    let too_small = extract_inner_size(line).is_some_and(|(w, h)| w < 600.0 || h < 440.0);
+    if !too_small {
+        return;
+    }
+
+    // 删掉这一行即可：eframe 读不到 window 状态就用 with_inner_size。
+    let cleaned: String = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("\"window\""))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    if std::fs::write(&path, cleaned).is_ok() {
+        eprintln!("[bell] 已重置异常的持久化窗口尺寸");
+    }
+}
+
+/// 从 app.ron 的 window 行里取出 `inner_size_points:(x:W,y:H)` 的宽高。
+fn extract_inner_size(line: &str) -> Option<(f32, f32)> {
+    let start = line.find("inner_size_points:(")?;
+    let rest = &line[start..];
+    let x_at = rest.find("x:")? + 2;
+    let comma = rest[x_at..].find(',')? + x_at;
+    let y_at = rest[comma..].find("y:")? + comma + 2;
+    let end = rest[y_at..].find(')')? + y_at;
+    let w: f32 = rest[x_at..comma].trim().parse().ok()?;
+    let h: f32 = rest[y_at..end].trim().parse().ok()?;
+    Some((w, h))
+}
+
+/// `%APPDATA%\bell-reminder`（eframe 默认的存储目录，与 app_id 同名）。
+fn dirs_app_data() -> Option<std::path::PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(std::path::PathBuf::from(appdata).join("bell-reminder"))
 }
 
 /// 系统字体字节缓存（微软雅黑 + 彩色 emoji）。

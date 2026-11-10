@@ -7403,9 +7403,22 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
             let vctx = vui.ctx().clone();
             // 自我校正：用**弹窗这个窗口自己的**缩放比把物理坐标换算回 points。
             // 万一 `toast_scale()` 与弹窗窗口实际的 scale 有偏差（例如主窗口
-            // 的缩放缓存过期），这里每帧都会把它纠回右下角，不会再漂到屏幕中间。
+            // 的缩放缓存过期），这里把它纠回右下角，不会再漂到屏幕中间。
+            //
+            // 只在位置**确实偏了**时才发 OuterPosition：set_outer_position 每次
+            // 都会 set_window_flags + InvalidateRgn，无条件每帧调用会让这个置顶
+            // 窗口持续「抖动」，干扰主窗口输入框正在进行的输入法候选窗（用户反馈
+            // 「提醒弹出时输入法无法显示候选内容」）。加阈值后，稳定状态下不再
+            // 每帧动窗口，输入法候选窗不再被打断。
             let child_ppp = vctx.pixels_per_point().max(0.5);
-            vctx.send_viewport_cmd(ViewportCommand::OuterPosition(pos_px / child_ppp));
+            let target = pos_px / child_ppp;
+            let needs_move = vctx
+                .input(|i| i.viewport().outer_rect)
+                .map(|r| (r.min - target).length() > 1.0)
+                .unwrap_or(true);
+            if needs_move {
+                vctx.send_viewport_cmd(ViewportCommand::OuterPosition(target));
+            }
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::NONE

@@ -601,6 +601,21 @@ impl GitStore {
                 Ok(SyncOutcome::Pulled)
             }
             (true, true) => {
+                // 两边都有「git 层面」的改动。先比用户内容：本机未提交的差异
+                // 若只是 last_fired/snooze_until 这类机器状态（提醒引擎自动写的），
+                // 而用户内容与远端一致，就不算冲突——直接对齐远端即可，
+                // 避免生成一份「与当前没有差异」的无意义副本。
+                let local_doc = DocStore::new(self.dir.clone()).load().ok();
+                let remote_doc = self.load_remote_doc(&branch).ok();
+                let real_conflict = match (local_doc, remote_doc) {
+                    (Some(l), Some(r)) => !l.user_content_eq(&r),
+                    // 读不出来（格式异常等）保守按真冲突处理，本机改动留底不丢
+                    _ => true,
+                };
+                if !real_conflict {
+                    self.pull()?;
+                    return Ok(SyncOutcome::Pulled);
+                }
                 // 冲突 → 冲突副本：本机当前状态存进 conflict 分支留底，
                 // 然后主数据对齐远端（Pulled），同步流程不中断。
                 let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
@@ -686,6 +701,32 @@ impl GitStore {
         Doc::from_year_parts(&index_text, &year_texts)
             .map(|d| d.normalized())
             .with_context(|| format!("解析冲突副本失败：{}", branch))
+    }
+
+    /// 读取远端分支（`origin/<branch>`，需先 fetch）上的数据文档。
+    ///
+    /// 与 `load_conflict_doc` 同款解析：索引 + 各年份文件。用于冲突判定里
+    /// 「本机用户内容 vs 远端用户内容」的比较。
+    fn load_remote_doc(&self, branch: &str) -> Result<Doc> {
+        let rev = format!("origin/{}", branch);
+        let index_text = self.run(&["show", &format!("{}:{}", rev, DOC_INDEX_FILE)])?;
+        #[derive(Deserialize)]
+        struct YearsProbe {
+            #[serde(default)]
+            years: Vec<i32>,
+        }
+        let years: Vec<i32> = serde_json::from_str::<YearsProbe>(&index_text)
+            .map(|p| p.years)
+            .unwrap_or_default();
+        let mut year_texts = Vec::new();
+        for y in years {
+            if let Ok(text) = self.run(&["show", &format!("{}:{}.json", rev, y)]) {
+                year_texts.push(text);
+            }
+        }
+        Doc::from_year_parts(&index_text, &year_texts)
+            .map(|d| d.normalized())
+            .with_context(|| format!("解析远端数据失败：{}", rev))
     }
 
     /// 删除一份冲突副本（本地 + 远端）。
@@ -1288,6 +1329,50 @@ mod tests {
         assert!(cdoc.records.iter().any(|r| r.title == "本机改动"), "副本 Doc 应含本机改动");
         git.delete_conflict_branch(name).unwrap();
         assert!(git.list_conflict_branches().unwrap().is_empty(), "删除后列表应为空");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 回归：本机未提交差异**只有机器状态**（last_fired，提醒引擎自动写的），
+    /// 远端有新提交但用户内容一致 → 应判 Pulled，不生成无意义的冲突副本。
+    /// （用户实测场景：副本与当前「内容不同 0」，覆盖按钮灰掉，只能删。）
+    #[test]
+    fn sync_round_machine_only_diff_is_not_conflict() {
+        use crate::model::DayRecord;
+        if !git_available() { return; }
+        let base = temp_dir();
+        let remote = base.join("remote.git");
+        git_ok(&base, &["init", "--bare", &remote.to_string_lossy()]);
+        let cfg = GitConfig { url: remote.to_string_lossy().into_owned(), branch: "main".into(), path: DOC_DIR_NAME.into(), ..Default::default() };
+
+        // 基线：一条记录，两端一致
+        let ds = DocStore::new(base.join("w"));
+        let t = Plan::new("例会".into(), String::new(), NaiveTime::from_hms_opt(9,0,0).unwrap());
+        let mut doc = Doc::default();
+        doc.records.push(DayRecord::from_template(&t, chrono::NaiveDate::from_ymd_opt(2026,11,7).unwrap()));
+        ds.save(&doc).unwrap();
+        let git = GitStore::new(base.join("w"), cfg.clone());
+        git.prepare().unwrap();
+        git.push("baseline").unwrap();
+
+        // 远端：从基线 clone（保证历史领先而非分叉），改 last_fired 后推送
+        git_ok(&base, &["clone", "-b", "main", &remote.to_string_lossy(), &base.join("other").to_string_lossy()]);
+        let other_ds = DocStore::new(base.join("other"));
+        let mut rdoc = other_ds.load().unwrap();
+        rdoc.records[0].last_fired = Some(chrono::Local::now());
+        other_ds.save(&rdoc).unwrap();
+        let other = GitStore::new(base.join("other"), cfg.clone());
+        other.push("other fired").unwrap();
+
+        // 本机：用户内容不变，只写 last_fired（模拟本机提醒触发后的落盘）
+        let mut ldoc = ds.load().unwrap();
+        ldoc.records[0].last_fired = Some(chrono::Local::now() + chrono::Duration::seconds(1));
+        ds.save(&ldoc).unwrap();
+        assert!(git.local_dirty().unwrap(), "本机应有未提交的机器状态差异");
+
+        // 两边都有 git 差异，但用户内容一致 → 不算冲突
+        assert_eq!(git.sync_round("自动拉取").unwrap(), SyncOutcome::Pulled);
+        assert!(git.list_conflict_branches().unwrap().is_empty(), "机器状态差异不应生成冲突副本");
 
         let _ = std::fs::remove_dir_all(&base);
     }

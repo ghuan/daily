@@ -650,6 +650,43 @@ impl Doc {
         indices
     }
 
+    /// 两份数据的**用户内容**是否一致（同步冲突判定用）。
+    ///
+    /// 只比较用户会编辑的字段：模板（标题/标签/备注/时间/周期/提醒策略/启用）、
+    /// 记录（日期/标题/标签/备注/时间/提醒策略/完成态/墓碑/定制标记）、标签字典。
+    /// **忽略机器状态**：`last_fired` / `snooze_until` / `created_at` / `done_at`
+    /// 时间戳——这些是提醒引擎自动写的，两台机器必然不同，但不代表用户改过数据。
+    /// 没有这层比较，「本机刚响过提醒 + 远端有新提交」就会被误判成冲突，
+    /// 生成一份「与当前没有差异」的无意义副本。
+    pub fn user_content_eq(&self, other: &Self) -> bool {
+        fn plan_key(p: &Plan) -> (Uuid, String, String, String, NaiveTime, RepeatRule, RemindWindow, bool) {
+            (p.id, p.title.clone(), p.tag.clone(), p.note.clone(), p.time, p.repeat, p.remind, p.enabled)
+        }
+        fn rec_key(r: &DayRecord) -> (Uuid, Option<Uuid>, NaiveDate, String, String, String, NaiveTime, RemindWindow, bool, bool, bool) {
+            (r.id, r.template_id, r.date, r.title.clone(), r.tag.clone(), r.note.clone(), r.time, r.remind, r.done, r.cancelled, r.customized)
+        }
+        // 按 id 排序后逐项比（RepeatRule/RemindWindow 只有 PartialEq，不能整组 sort）
+        let mut a: Vec<_> = self.templates.iter().map(plan_key).collect();
+        let mut b: Vec<_> = other.templates.iter().map(plan_key).collect();
+        a.sort_by_key(|k| k.0);
+        b.sort_by_key(|k| k.0);
+        if a != b {
+            return false;
+        }
+        let mut a: Vec<_> = self.records.iter().map(rec_key).collect();
+        let mut b: Vec<_> = other.records.iter().map(rec_key).collect();
+        a.sort_by_key(|k| k.0);
+        b.sort_by_key(|k| k.0);
+        if a != b {
+            return false;
+        }
+        let mut ta = self.tags.clone();
+        let mut tb = other.tags.clone();
+        ta.sort();
+        tb.sort();
+        ta == tb
+    }
+
     /// 汇总标签字典 + 模板/记录里出现过的标签（去重、去空串），按字典序返回。
     pub fn all_tags(&self) -> Vec<String> {
         let mut tags: Vec<String> = self

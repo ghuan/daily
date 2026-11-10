@@ -3838,8 +3838,12 @@ fn ui_month_grid(app: &mut PlanApp, ui: &mut egui::Ui, today: NaiveDate) {
         );
 
         if in_month && data.total > 0 {
-            // 只画「有计划」的蓝点；完成状态由格内标题淡化表现
-            let color = theme::ACCENT;
+            // 有计划 → 蓝点；当天全部完成 → 绿点
+            let color = if data.done == data.total {
+                theme::OK
+            } else {
+                theme::ACCENT
+            };
             painter.circle_filled(
                 egui::pos2(cell.right() - 10.0, cell.top() + 11.0),
                 3.5,

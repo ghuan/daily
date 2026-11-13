@@ -6111,47 +6111,87 @@ mod workflow_tests {
         assert_eq!(window_fire_count(&state), 1);
     }
 
-    /// 弹窗定位：必须落在工作区**右下角**，且与缩放比无关。
-    ///
-    /// 回归场景：主窗口缓存了过期的 `pixels_per_point`（1.5），
-    /// 而实际桌面是 96 DPI（1.0）。当时把 1920px 宽的工作区除以 1.5，
-    /// 得到 1280 points，卡片 x 落在 842px —— 水平方向 44%，也就是
-    /// 用户看到的「跑到屏幕中间」。
+    /// 弹窗定位：必须落在工作区**右下角**（全部按 points 计算）。
     #[test]
     fn toast_layout_sticks_to_bottom_right() {
         const CARD_W: f32 = 420.0;
         const MARGIN: f32 = 18.0;
         const GAP: f32 = 10.0;
 
-        // 1920×1032 工作区（1080 屏减任务栏），三种真实缩放比。
         let work = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1920.0, 1032.0));
-        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
-            let h = 128.0;
-            let boxes = toast_layout_px(work, scale, CARD_W, MARGIN, GAP, &[h]);
-            let p = boxes[0];
+        let h = 128.0;
+        let boxes = toast_layout_points(work, CARD_W, MARGIN, GAP, &[h]);
+        let p = boxes[0];
 
-            let card_w_px = CARD_W * scale;
-            let margin_px = MARGIN * scale;
-            // 右边贴边：右边界正好是 屏宽 - 边距。
+        // 右边贴边：右边界正好是 屏宽 - 边距。
+        assert!(
+            (p.x + CARD_W - (work.max.x - MARGIN)).abs() < 0.01,
+            "右边未贴齐, x={} w={}",
+            p.x,
+            CARD_W
+        );
+        // 底边贴边。
+        assert!(
+            (p.y + h - (work.max.y - MARGIN)).abs() < 0.01,
+            "底边未贴齐, y={}",
+            p.y
+        );
+        // 关键回归点：卡片必须落在屏幕右半边，绝不能漂到中间去。
+        assert!(
+            p.x > work.max.x * 0.5,
+            "卡片跑到屏幕中间了, x={} / {}",
+            p.x,
+            work.max.x
+        );
+    }
+
+    /// 方案 A 的核心不变量：物理像素工作区 / 弹窗 ppp → points 布局 → 乘回
+    /// 同一个 ppp，卡片右下角**始终贴着工作区右下角**，绝不会漂到屏幕中间。
+    ///
+    /// 关键：换算「进/出用同一系数」，所以即便 RDP 重连后 winit 缓存的
+    /// scale_factor 还是旧值，除进去又乘回来依旧恒等 —— 卡片永远锚在右下角。
+    /// 这正是早期「用 GetDpiForSystem 猜 scale」做不到的：那时卡片宽度按错误
+    /// 系数折成物理像素，右边距会差一两百像素，就是「弹窗跑到屏幕中间」。
+    ///
+    /// 注意边距是 **points**，换算成物理像素是 `MARGIN * ppp`（18pt 在 125%
+    /// 下 = 22.5px），而不是恒定 18px —— 这样卡片在任何 DPI 下视觉尺寸一致。
+    #[test]
+    fn toast_layout_points_is_scale_invariant() {
+        const CARD_W: f32 = 420.0;
+        const MARGIN: f32 = 18.0;
+        const GAP: f32 = 10.0;
+        const H: f32 = 128.0;
+
+        // 1920×1032 物理像素工作区（1080 屏减任务栏）。
+        let work_px =
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1920.0, 1032.0));
+
+        for ppp in [1.0_f32, 1.25, 1.5, 2.0, 0.75] {
+            // 调用方：物理工作区折成 points。
+            let work_points = work_px / ppp;
+            let p = toast_layout_points(work_points, CARD_W, MARGIN, GAP, &[H])[0];
+            // egui-winit：points 结果乘回同一个 ppp 变成物理像素。
+            let left_px = p.x * ppp;
+            let right_px = (p.x + CARD_W) * ppp;
+            let bottom_px = (p.y + H) * ppp;
+
+            // 右边 / 底边距工作区边缘正好是 MARGIN 个 points。
+            let expected_right_px = work_px.max.x - MARGIN * ppp;
+            let expected_bottom_px = work_px.max.y - MARGIN * ppp;
             assert!(
-                (p.x + card_w_px - (work.max.x - margin_px)).abs() < 0.01,
-                "scale={scale}: 右边未贴齐, x={} w={}",
-                p.x,
-                card_w_px
+                (right_px - expected_right_px).abs() < 0.01,
+                "ppp={ppp}: 物理右边界漂移, right={right_px} 期望={expected_right_px}"
             );
-            // 底边贴边。
             assert!(
-                (p.y + h * scale - (work.max.y - margin_px)).abs() < 0.01,
-                "scale={scale}: 底边未贴齐, y={}",
-                p.y
+                (bottom_px - expected_bottom_px).abs() < 0.01,
+                "ppp={ppp}: 物理底边漂移, bottom={bottom_px} 期望={expected_bottom_px}"
             );
-            // 关键回归点：不管缩放比多少，卡片都必须落在屏幕右半边，
-            // 绝不能漂到中间去。
+            // 用户可见的回归点：不管 ppp 多少，卡片左边界始终在屏幕右半边，
+            // 绝不会像早期版本那样落到水平 44%（屏幕中间）。
             assert!(
-                p.x > work.max.x * 0.5,
-                "scale={scale}: 卡片跑到屏幕中间了, x={} / {}",
-                p.x,
-                work.max.x
+                left_px > work_px.max.x * 0.5,
+                "ppp={ppp}: 卡片跑到屏幕中间了, left_px={left_px} / {}",
+                work_px.max.x
             );
         }
     }
@@ -6166,7 +6206,7 @@ mod workflow_tests {
 
         // 三条正常高度：依次向上，且互不重叠。
         let heights = [128.0_f32, 106.0, 106.0];
-        let boxes = toast_layout_px(work, 1.0, CARD_W, MARGIN, GAP, &heights);
+        let boxes = toast_layout_points(work, CARD_W, MARGIN, GAP, &heights);
         for w in boxes.windows(2) {
             assert!(w[1].y < w[0].y, "后一条应在上面");
         }
@@ -6176,7 +6216,7 @@ mod workflow_tests {
 
         // 超多卡片：不能跑到工作区上沿之外。
         let many: Vec<f32> = vec![200.0; 20];
-        let boxes = toast_layout_px(work, 1.0, CARD_W, MARGIN, GAP, &many);
+        let boxes = toast_layout_points(work, CARD_W, MARGIN, GAP, &many);
         for b in &boxes {
             assert!(
                 b.y >= work.min.y + MARGIN - 0.01,
@@ -7194,48 +7234,55 @@ fn toast_estimate_content_h(has_note: bool) -> f32 {
     }
 }
 
-/// 主屏「工作区」矩形，单位是**物理像素**（已扣掉任务栏）。
+/// 主窗口所在显示器的「工作区」矩形，单位是**物理像素**（已扣掉任务栏）。
 ///
-/// 用 `SystemParametersInfo(SPI_GETWORKAREA)` 取真实可用区域，比
-/// `viewport().monitor_size` 可靠：后者在 egui-winit 里是
-/// `monitor.size().to_logical(pixels_per_point)`，一旦 `pixels_per_point`
-/// 和显示器实际缩放不一致（例如切换过分辨率/缩放、或远程桌面重连），
-/// 拿到的数值就是错的。
+/// 用 `MonitorFromWindow(MAIN_HWND)` 找到主窗口实际所在的显示器，再用
+/// `GetMonitorInfoW(..., rcWork)` 取该显示器的工作区：
+/// - 支持多屏：`rcWork` 是虚拟桌面坐标系里的物理像素，副屏在左侧时 x 可以是负的；
+/// - 支持远程桌面重连后分辨率/DPI 变化：这里每帧重新问 OS，不缓存；
+/// - 比 `SPI_GETWORKAREA` 更准：后者只返回**主显示器**，主窗口拖到副屏时就会算错。
 ///
 /// 注意这里**只返回物理像素**，不做任何 points 换算：换算必须用弹窗
 /// 自己的缩放比来做，详见 `ui_popups()` 里的说明。
 #[cfg(windows)]
 fn toast_work_area_px() -> Option<egui::Rect> {
-    use windows_sys::Win32::Foundation::RECT;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA};
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, MONITORINFO,
+        MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+    };
 
-    let mut rect = RECT {
-        left: 0,
-        top: 0,
-        right: 0,
-        bottom: 0,
+    let raw = MAIN_HWND.load(Ordering::Relaxed);
+    let hwnd = raw as *mut core::ffi::c_void;
+    // 主窗口句柄还没记下来时退回主显示器。
+    let hmon = if raw != 0 {
+        unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }
+    } else {
+        core::ptr::null_mut()
     };
-    // 第三个参数是输出缓冲区指针，SPI_GETWORKAREA 会写入 RECT。
-    let ok = unsafe {
-        SystemParametersInfoW(
-            SPI_GETWORKAREA,
-            0,
-            &mut rect as *mut RECT as *mut core::ffi::c_void,
-            0,
-        )
+    let hmon = if hmon.is_null() {
+        let origin = POINT { x: 0, y: 0 };
+        unsafe { MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY) }
+    } else {
+        hmon
     };
-    if ok == 0 {
+    if hmon.is_null() {
         return None;
     }
-    let (l, t) = (rect.left as f32, rect.top as f32);
-    let (r, b) = (rect.right as f32, rect.bottom as f32);
-    if r - l < 400.0 || b - t < 300.0 {
+
+    let mut mi: MONITORINFO = unsafe { core::mem::zeroed() };
+    mi.cbSize = core::mem::size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(hmon, &mut mi) } == 0 {
         return None;
     }
-    Some(egui::Rect::from_min_max(
-        egui::pos2(l, t),
-        egui::pos2(r, b),
-    ))
+    let r = &mi.rcWork;
+    let (l, t) = (r.left as f32, r.top as f32);
+    let (rr, b) = (r.right as f32, r.bottom as f32);
+    // 明显不合理的值（例如 RDP 会话断开瞬间显示器被摘掉）就走兜底。
+    if rr - l < 400.0 || b - t < 300.0 {
+        return None;
+    }
+    Some(egui::Rect::from_min_max(egui::pos2(l, t), egui::pos2(rr, b)))
 }
 
 #[cfg(not(windows))]
@@ -7243,73 +7290,45 @@ fn toast_work_area_px() -> Option<egui::Rect> {
     None
 }
 
-/// 主屏**当前真实**的缩放比（1.0 = 96 DPI，1.5 = 144 DPI）。
+/// 提醒弹窗的「右下角堆叠」位置计算，**输入输出全部是 egui points**。
 ///
-/// 必须问 Windows，不能用 `ctx.pixels_per_point()`：后者是 egui 内部缓存的
-/// 值，来自窗口创建时 winit 报告的 scale factor。如果进程启动后显示环境变了
-/// （切换分辨率、改缩放、远程桌面重连），主窗口可能收不到
-/// `ScaleFactorChanged`，这个缓存就会一直停在旧值。
+/// 这是方案 A 的关键：整个定位链路只用一个坐标系。调用方先把 Win32 给的
+/// 物理像素工作区除以**弹窗自己的** `pixels_per_point()` 得到 points，布局
+/// 算完的 points 再交给 `with_position` / `ViewportCommand::OuterPosition`，
+/// egui-winit 会用同一个系数把它乘回物理像素 —— 进/出恒等，卡片必然落在
+/// 正确位置，与系统 DPI、远程桌面重连、主窗口缓存是否过期都无关。
 ///
-/// 真实场景：进程在 150% 下启动，之后桌面变成 100%，`ctx.pixels_per_point()`
-/// 仍是 1.5。用它把 1920 物理像素的工作区折算成 1280 points，弹窗就会落在
-/// 屏幕水平方向 44%~66% 的位置 —— 也就是用户看到的「跑到屏幕中间」。
-#[cfg(windows)]
-fn toast_scale(ctx: &egui::Context) -> f32 {
-    use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
-    let dpi = unsafe { GetDpiForSystem() };
-    if dpi >= 48 {
-        dpi as f32 / 96.0
-    } else {
-        ctx.pixels_per_point().max(0.5)
-    }
-}
-
-#[cfg(not(windows))]
-fn toast_scale(ctx: &egui::Context) -> f32 {
-    ctx.pixels_per_point().max(0.5)
-}
-
-/// 提醒弹窗的「右下角堆叠」位置计算，单位统一为**物理像素**。
+/// 早期版本在物理像素里布局、乘一个从 `GetDpiForSystem()` 猜出来的 scale，
+/// RDP 下这个 scale 和弹窗窗口真实的 scale 不一致，卡片宽度按错误系数折成
+/// 物理像素，逐帧纠正左上角也补不回右边距 —— 就是「弹窗跑到屏幕中间」的根因。
 ///
 /// 抽成纯函数是为了能写单元测试：定位这类 bug 一旦回归，
 /// 用户看到的现象是「到点了没提醒」（窗口飞到屏幕外）或「弹窗跑到中间」，
 /// 都很难靠肉眼复现。
 ///
-/// * `work_px`  —— 主屏工作区（物理像素，已扣任务栏）
-/// * `scale`    —— 该显示器真实缩放比（1.0 = 96 DPI）
-/// * `card_w`   —— 卡片逻辑宽度
-/// * `sizes`    —— 每条提醒的卡片逻辑高度，按**叠放顺序**给（末尾那条在最下面）
+/// * `work_points` —— 工作区（egui points，已扣任务栏）
+/// * `card_w`      —— 卡片宽度（points）
+/// * `sizes`       —— 每条提醒的卡片高度（points），按**叠放顺序**给（末尾那条在最下面）
 ///
-/// 返回每张卡片的左上角**物理像素**坐标，顺序与 `sizes` 一致。
-fn toast_layout_px(
-    work_px: egui::Rect,
-    scale: f32,
+/// 返回每张卡片的左上角 points 坐标，顺序与 `sizes` 一致。
+fn toast_layout_points(
+    work_points: egui::Rect,
     card_w: f32,
     margin: f32,
     gap: f32,
     sizes: &[f32],
 ) -> Vec<egui::Pos2> {
-    let scale = if scale.is_finite() && scale > 0.0 {
-        scale
-    } else {
-        1.0
-    };
-    // 逻辑尺寸 → 物理像素。
-    let card_w_px = card_w * scale;
-    let margin_px = margin * scale;
-    let gap_px = gap * scale;
-    let area = work_px;
+    let area = work_points;
     // 右下角贴边，逐条向上叠。
-    let left = area.max.x - card_w_px - margin_px;
-    let mut bottom = area.max.y - margin_px;
+    let left = area.max.x - card_w - margin;
+    let mut bottom = area.max.y - margin;
     let mut out = Vec::with_capacity(sizes.len());
     for h in sizes {
-        let h_px = h * scale;
-        let mut y = bottom - h_px;
+        let mut y = bottom - h;
         // 顶到屏幕上沿就不再上移，避免超出工作区。
-        y = y.max(area.min.y + margin_px);
+        y = y.max(area.min.y + margin);
         out.push(egui::pos2(left, y));
-        bottom = y - gap_px;
+        bottom = y - gap;
     }
     out
 }
@@ -7327,42 +7346,42 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
     // ── 坐标系说明（这段是踩坑记录，改动前务必读完）────────────────────────
     //
     // 提醒弹窗是**独立的 OS 窗口**，不是主窗口里的控件，所以它的位置要走
-    // `ViewportBuilder::with_position`（单位：egui points）。
+    // `ViewportBuilder::with_position` / `ViewportCommand::OuterPosition`
+    // （单位：egui points）。
     //
     // egui-winit 把 points 转成物理像素时，用的是**那个窗口自己的**
-    // `pixels_per_point = zoom_factor × native_scale`。问题在于
-    // `ctx.pixels_per_point()` 是 egui 内部缓存的值，来自窗口创建时 winit
-    // 报告的 scale factor；进程启动后如果显示环境变了（改缩放比例、
-    // 切换分辨率、远程桌面重连），主窗口可能根本收不到
-    // `ScaleFactorChanged`，这个缓存就一直停在旧值上。
+    // `pixels_per_point = zoom_factor × window.scale_factor()`，而且每帧从
+    // `window.scale_factor()` 重新取（见 egui-winit 的 take_egui_input /
+    // update_viewport_info）。所以正确做法是「进/出用同一个系数」：
+    //   1. 工作区从 OS 拿到的是物理像素（GetMonitorInfoW.rcWork）；
+    //   2. 在弹窗回调里用**弹窗自己**的 pixels_per_point() 把工作区除成 points；
+    //   3. 布局在 points 里算完，交给 with_position / OuterPosition；
+    //   4. egui-winit 再乘回同一个系数 → 物理位置 = 我们想要的物理位置，恒等。
     //
-    // 真实复现：进程在 150% 下启动 → 远程桌面把桌面变成 100%（96 DPI）。
-    // 此时 `ctx.pixels_per_point()` 仍是 1.5，而新弹窗窗口的 scale 是 1.0。
-    // 把 1920 物理像素的工作区除以 1.5 得到 1280 points，算出
-    // x = 1280 - 420 - 18 = 842，再被弹窗按 1.0 转回物理像素 → 842 px，
-    // 而屏幕有 1920 px 宽 —— 弹窗就落在水平 44% 的位置，也就是
-    // 用户看到的「跑到屏幕中间」。
+    // 早期版本反过来：在物理像素里布局，乘一个 `GetDpiForSystem()` 猜出来的
+    // scale。远程桌面重连改了 DPI/分辨率后，这个 scale 和弹窗窗口真实的
+    // pixels_per_point 对不上，卡片宽度按错误系数折成物理像素，逐帧纠正左上角
+    // 也补不回右边距 —— 也就是用户看到的「弹窗跑到屏幕中间」。主窗口缓存的
+    // `ctx.pixels_per_point()` 同样可能是过期值，一律不用。
     //
-    // 所以：**缩放比必须现问 Windows（GetDpiForSystem），不能用
-    // ctx.pixels_per_point()**。见 `toast_scale()`。
-    let scale = toast_scale(ctx);
+    // 另：工作区取自主窗口所在的显示器（MonitorFromWindow），而不是
+    // SPI_GETWORKAREA 只给的主屏，多屏 / RDP 虚拟屏都能覆盖。
 
-    // 可用屏幕区域（= 屏幕减去任务栏），单位 points，供 `with_position` 用。
-    let work_area = toast_work_area_px().unwrap_or_else(|| {
-        // 非 Windows 或取不到时的兜底：用 viewport 的物理像素尺寸。
+    // 工作区：OS 给的物理像素（每帧现问，自动吸收 RDP 重连后的变化）。
+    let work_px = toast_work_area_px().unwrap_or_else(|| {
+        // 非 Windows 或取不到时的兜底：egui 0.37 的 monitor_size 是 egui points，
+        // 乘主窗口 ppp 折回物理像素，保持后面链路单位一致。
         let ppp = ctx.pixels_per_point().max(0.5);
         let size = ctx
             .input(|i| i.viewport().monitor_size)
             .unwrap_or(egui::vec2(1920.0, 1080.0));
-        // monitor_size 在不同 egui 版本里单位不一致，这里按「物理像素」处理。
-        let px = if size.x > 3000.0 { size / ppp } else { size * ppp };
-        egui::Rect::from_min_size(egui::Pos2::ZERO, px)
+        egui::Rect::from_min_size(egui::Pos2::ZERO, size * ppp)
     });
     let mut actions: Vec<PopupAction> = Vec::new();
     let mut measured: Vec<(Uuid, f32)> = Vec::new();
     let total_popups = app.popups.len();
 
-    // 先把所有卡片的高度算出来，统一交给 `toast_layout_px()` 求位置。
+    // 先把所有卡片的高度算出来（points），统一交给 `toast_layout_points()` 求位置。
     // 顺序：`app.popups` 末尾那条在最下面，所以反着叠放。
     let heights: Vec<f32> = (0..app.popups.len())
         .rev()
@@ -7378,20 +7397,25 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
             content_h + TOAST_PAD_TOP + TOAST_PAD_BOTTOM
         })
         .collect();
-    let boxes_px = toast_layout_px(work_area, scale, CARD_W, MARGIN, GAP, &heights);
+
+    // 建窗用的种子位置：建窗那一刻还拿不到「弹窗自己的」pixels_per_point，
+    // 只能用主窗口的 ppp 估一个 points 值。首帧回调里会用弹窗真实 ppp 重算并
+    // 纠正（见下），所以这个估值即使过期也只会影响建窗那一瞬间。
+    let seed_ppp = ctx.pixels_per_point().max(0.5);
+    let boxes_seed = toast_layout_points(work_px / seed_ppp, CARD_W, MARGIN, GAP, &heights);
 
     for (slot, idx) in (0..app.popups.len()).rev().enumerate() {
         let popup = &app.popups[idx];
         let h = heights[slot];
-        // 目标位置始终是**物理像素**，建窗和逐帧纠正都从这里换算。
-        let pos_px = boxes_px[slot];
-        let pos = pos_px / scale;
+        // 建窗种子位置（points）：首帧还没有弹窗自己的 ppp，只能用主窗口的估一个。
+        // 首帧回调里会用弹窗真实 ppp 重算并纠正，所以过期值只影响建窗那一瞬。
+        let seed_pos = boxes_seed[slot];
 
         let viewport_id = egui::ViewportId::from_hash_of(("record-toast", popup.record_id));
         let builder = egui::ViewportBuilder::default()
             .with_title("")
             .with_inner_size([CARD_W, h])
-            .with_position(pos)
+            .with_position(seed_pos)
             .with_resizable(false)
             .with_decorations(false)
             .with_always_on_top()
@@ -7401,17 +7425,20 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
 
         ctx.show_viewport_immediate(viewport_id, builder, |vui, _| {
             let vctx = vui.ctx().clone();
-            // 自我校正：用**弹窗这个窗口自己的**缩放比把物理坐标换算回 points。
-            // 万一 `toast_scale()` 与弹窗窗口实际的 scale 有偏差（例如主窗口
-            // 的缩放缓存过期），这里把它纠回右下角，不会再漂到屏幕中间。
+            // 方案 A 的核心：用**弹窗这个窗口自己的** pixels_per_point 把
+            // 物理像素工作区折成 points，布局在 points 里算完，egui-winit 再用
+            // 同一个系数把 with_position / OuterPosition 乘回物理像素 —— 进/出
+            // 恒等，卡片必然落在正确物理位置，与系统 DPI、RDP 重连、主窗口
+            // 缓存是否过期都无关。首帧会借此把「种子位置」纠到正确值。
             //
-            // 只在位置**确实偏了**时才发 OuterPosition：set_outer_position 每次
-            // 都会 set_window_flags + InvalidateRgn，无条件每帧调用会让这个置顶
-            // 窗口持续「抖动」，干扰主窗口输入框正在进行的输入法候选窗（用户反馈
-            // 「提醒弹出时输入法无法显示候选内容」）。加阈值后，稳定状态下不再
-            // 每帧动窗口，输入法候选窗不再被打断。
+            // 与 8b0797f 的 IME 修复一样，只在位置**确实偏了**时才发 OuterPosition：
+            // set_outer_position 每次都会 set_window_flags + InvalidateRgn，无条件
+            // 每帧调用会让置顶窗口持续「抖动」，干扰主窗口输入框正在进行的输入法
+            // 候选窗（用户反馈「提醒弹出时输入法无法显示候选内容」）。加阈值后，
+            // 稳定状态下不再每帧动窗口，输入法候选窗不再被打断。
             let child_ppp = vctx.pixels_per_point().max(0.5);
-            let target = pos_px / child_ppp;
+            let target =
+                toast_layout_points(work_px / child_ppp, CARD_W, MARGIN, GAP, &heights)[slot];
             let needs_move = vctx
                 .input(|i| i.viewport().outer_rect)
                 .map(|r| (r.min - target).length() > 1.0)

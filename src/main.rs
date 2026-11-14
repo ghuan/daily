@@ -203,6 +203,9 @@ fn install_tray_event_handlers(ctx: &egui::Context) {
             menu_ctx.request_repaint();
         }
     }));
+
+    // 后台心跳：解决「最小化后提醒不弹、同步停摆」。详见函数文档。
+    start_background_heartbeat(ctx);
 }
 
 fn request_ui_wake() {
@@ -211,6 +214,30 @@ fn request_ui_wake() {
             ctx.request_repaint();
         }
     }
+}
+
+/// 后台心跳线程：每秒从**非 UI 线程**发起一次 repaint 请求。
+///
+/// 为什么需要：窗口最小化后 Windows 不派发 RedrawRequested，eframe 只在
+/// 「队列里有 repaint 请求」时才补跑一帧（update_logic_only）。而旧版心跳
+/// （request_repaint_after(1s)）发自 `ui()`——最小化后 `ui()` 不执行，请求
+/// 断流，事件循环 `ControlFlow::Wait` 永远等不到下一个唤醒点，`tick()`/
+/// `poll_sync()`/托盘事件全部停摆，到点的提醒堆积到恢复窗口才一次性弹出。
+///
+/// `egui::Context` 是 Send+Sync 的（内部 Arc），线程里调用
+/// `request_repaint_after` 会经 eframe 预设的回调向 winit 事件循环投递
+/// `UserEvent::RequestRepaint`，从而把 `ControlFlow` 推到下一个唤醒点——
+/// 这正是「从外部叫醒 sleeping 事件循环」的唯一可靠通道。
+/// logic() 里的 repaint 请求仍然保留：窗口可见时二者合并取更近者。
+fn start_background_heartbeat(ctx: &egui::Context) {
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        loop {
+            // 请求立即重绘；eframe 对不可见窗口有 100ms 节流，不会忙等。
+            ctx.request_repaint();
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
 }
 
 /// 清掉进程被强杀时残留在通知区的托盘图标。
@@ -2000,6 +2027,11 @@ impl PlanApp {
             notify::play();
         }
         ctx.request_repaint();
+        // 关键：窗口最小化/隐藏时，普通 repaint 只会跑 logic-only pass，
+        // `ui()`（含 toast viewport 的创建与渲染）不会执行，弹窗永远画不出来。
+        // RequestPaintWhileHidden 强制 eframe 跑一次完整 ui pass，即使窗口隐藏
+        // —— toast 是独立置顶窗口，这样它才能在主窗口最小化时正常弹出。
+        ctx.send_viewport_cmd(ViewportCommand::RequestPaintWhileHidden);
     }
 
     // ---------- 记录与模板操作 ----------

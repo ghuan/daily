@@ -2294,27 +2294,20 @@ fn git_ready(settings: &Settings) -> bool {
 }
 
 impl eframe::App for PlanApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        let ctx = &ctx;
-        self.frames_drawn = self.frames_drawn.saturating_add(1);
-        // 托盘**不在首帧创建**：`TrayIconBuilder::build()` 要和 Windows 通知区交互
-        // （实测约 20ms），放在首帧会把这一帧拖到 30ms 以上 —— 而 eframe 对「不可见窗口」
-        // 每 100ms 补画一次，首帧越慢，窗口在内容画好之前被显示/隐藏的次数就越多
-        // （用户看到的就是启动时白窗闪两三下）。
-        // 推迟一帧后，首帧只剩纯绘制（约 8ms），窗口第一次出现就是画好的界面。
-        if self.frames_drawn > 1 {
-            self.ensure_tray();
-        }
-        // 窗口已真正创建后再把标题栏设为浅色（见 force_light_titlebar 说明）。
-        // 只在前几帧写：库的深色默认值是启动阶段设的，之后不会反复改回来。
-        if (2..=6).contains(&self.frames_drawn) {
-            force_light_titlebar();
-        }
+    /// 后台心跳：**每帧都会调用**，且窗口最小化/被遮挡时 eframe 走
+    /// `update_logic_only` 也会持续调用这里（前提是有 repaint 请求，
+    /// 见函数末尾的 request_repaint_after）。
+    ///
+    /// 所有「与渲染无关、必须持续运行」的工作都放这里：
+    /// 提醒判定（tick）、同步轮询（poll_sync）、托盘事件与退出处理。
+    /// 之前它们在 `ui()` 里，窗口最小化后 `ui()` 停止执行，提醒全部堆积到
+    /// 恢复窗口才一次性弹出（用户反馈「最小化的时候好久没弹出来，
+    /// 打开窗口后就弹出来了」）。
+    ///
+    /// 注意：这里**不允许**做任何 UI/绘制（eframe 文档要求），弹窗渲染仍在
+    /// `ui()` → `ui_popups()`。
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_tray_events(ctx);
-        // 每帧记一次心跳（只在前 3 次与退出请求后的帧写，避免日志膨胀）
-        if QUIT_REQUESTED.load(Ordering::SeqCst) {
-        }
         // 托盘「退出」：先显式 drop 托盘图标（Drop 里会发 NIM_DELETE，
         // 图标立刻从通知区消失；不 drop 的话进程退出后图标会残留成僵尸，
         // 要等鼠标划过通知区才消失——就是用户反馈的现象）。
@@ -2332,6 +2325,7 @@ impl eframe::App for PlanApp {
         self.poll_sync();
 
         // 关闭按钮 → 隐藏到托盘；只有托盘「退出」才允许真正关闭。
+        // （logic 阶段没有 egui pass，input 里只有 viewport 状态，够用。）
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.hide_main_window(ctx);
@@ -2340,11 +2334,34 @@ impl eframe::App for PlanApp {
         // 另一个进程双击了 exe → 把窗口调出来
         if SHOW_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.show_main_window(ctx);
-            ctx.request_repaint();
         }
 
         self.tick(ctx);
 
+        // 维持心跳：窗口可见时 ui() 末尾也会请求（二者合并取更近者）；
+        // 窗口最小化/隐藏时 ui() 不执行，靠这里维持每秒一帧的 logic 节拍，
+        // 保证提醒、同步、托盘事件不因窗口隐藏而停摆。
+        ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
+        self.frames_drawn = self.frames_drawn.saturating_add(1);
+        // 托盘**不在首帧创建**：`TrayIconBuilder::build()` 要和 Windows 通知区交互
+        // （实测约 20ms），放在首帧会把这一帧拖到 30ms 以上 —— 而 eframe 对「不可见窗口」
+        // 每 100ms 补画一次，首帧越慢，窗口在内容画好之前被显示/隐藏的次数就越多
+        // （用户看到的就是启动时白窗闪两三下）。
+        // 推迟一帧后，首帧只剩纯绘制（约 8ms），窗口第一次出现就是画好的界面。
+        if self.frames_drawn > 1 {
+            self.ensure_tray();
+        }
+        // 窗口已真正创建后再把标题栏设为浅色（见 force_light_titlebar 说明）。
+        // 只在前几帧写：库的深色默认值是启动阶段设的，之后不会反复改回来。
+        if (2..=6).contains(&self.frames_drawn) {
+            force_light_titlebar();
+        }
+        self.poll_sync();
         ui_sidebar(self, ui);
         match self.page {
             WorkspacePage::Calendar => ui_calendar_workspace(self, ui),

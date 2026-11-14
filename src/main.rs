@@ -434,6 +434,38 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // panic 落盘：release 版 windows_subsystem=windows 没有控制台，panic 信息
+    // 会被吞掉。而 `panic = "abort"`（profile.release）把它变成 0xc0000409
+    // 快速失败，用户只看到进程消失。把消息+回写进 exe 旁的 panic.log，
+    // 最小化弹窗路径（20:00 槽位实测）两次崩溃都靠它定位。
+    std::panic::set_hook(Box::new(|info| {
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "non-string panic payload".to_string()
+        };
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let bt = std::backtrace::Backtrace::force_capture().to_string();
+        let log = format!(
+            "[{}] PANIC at {loc}\n{msg}\n{bt}\n",
+            Local::now().format("%Y-%m-%d %H:%M:%S%.3f")
+        );
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("panic.log")
+        {
+            let _ = f.write_all(log.as_bytes());
+        }
+        eprintln!("{log}");
+    }));
+
     // 先把字体读进内存（约 20MB，几百毫秒），**再**建窗：这样窗口出现时首帧能立刻
     // 画出来，不会出现「窗已可见但内容还没画上」的白底。
     let _ = font_cache();

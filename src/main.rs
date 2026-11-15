@@ -619,7 +619,99 @@ static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsiz
 /// 窗口是否处于「收到托盘」状态。
 static HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// 记录主窗口句柄，供托盘/双击唤醒使用。
+/// 原 WNDPROC：子类化主窗口后用于转交消息。
+#[cfg(windows)]
+static ORIG_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// 主窗口最小化拦截：把「真最小化」换成「隐藏到托盘」。
+///
+/// 为什么必须拦：真最小化后 Windows 把客户区缩成 0×0，而 WGL 的 surface resize
+/// 是 no-op（glutin wgl surface.rs:255），swap_buffers 时驱动读 HWND 客户区 ——
+/// Intel ICD（ig9icd64.dll）在 0×0 surface 上已实测崩溃（00:11 的 0xc0000005）。
+/// 同时 eframe 的 `RequestPaintWhileHidden` 会在最小化窗口上强制跑完整渲染
+/// ——「最小化弹提醒」的 3 次崩溃（18:00/19:00/14:00，0xc0000409 fastfail，
+/// 同一 offset）与这次驱动崩溃全部指向该路径；分配器在异常尺寸下爆出
+/// alloc error 直接 abort（不经过 panic hook，所以 panic.log 始终为空）。
+///
+/// 拦截后：点最小化 = 走既有的「隐藏到托盘」（分层透明，非最小化），
+/// 窗口保持正常客户区尺寸，GL surface 恒非 0×0，toast 弹出路径不再踩雷。
+#[cfg(windows)]
+unsafe extern "system" fn bell_wndproc(
+    hwnd: *mut core::ffi::c_void,
+    msg: u32,
+    wparam: usize,
+    lparam: isize,
+) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, SC_MINIMIZE, WM_SYSCOMMAND,
+    };
+
+    if msg == WM_SYSCOMMAND && (wparam & 0xFFF0) == SC_MINIMIZE as usize {
+        // 交给既有的托盘隐藏路径（由 UI 线程的 app 处理）。
+        MINIMIZE_REQUESTED.store(true, Ordering::SeqCst);
+        if let Some(ctx) = ui_context_snapshot() {
+            ctx.request_repaint();
+        }
+        return 0; // 吞掉最小化
+    }
+    let orig = ORIG_WNDPROC.load(Ordering::Relaxed) as usize;
+    if orig != 0 {
+        let proc: unsafe extern "system" fn(
+            *mut core::ffi::c_void,
+            u32,
+            usize,
+            isize,
+        ) -> isize = core::mem::transmute(orig);
+        proc(hwnd, msg, wparam, lparam)
+    } else {
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+}
+
+/// 主窗口最小化请求（由 WNDPROC 拦截 SC_MINIMIZE 置位，logic 里消费）。
+static MINIMIZE_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 取一份 egui Context 快照（供原生回调唤醒 UI 线程）。
+fn ui_context_snapshot() -> Option<egui::Context> {
+    if let Some(Ok(slot)) = UI_CONTEXT.get().map(|cell| cell.lock()) {
+        slot.as_ref().cloned()
+    } else {
+        None
+    }
+}
+
+/// 安装主窗口子类：拦截 SC_MINIMIZE（详见 bell_wndproc 文档）。
+/// 在首帧 `remember_main_hwnd` 之后调用一次。
+#[cfg(windows)]
+fn install_minimize_intercept() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
+
+    let raw = MAIN_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        let _ = std::fs::write(
+            "subclass.log",
+            format!("install skipped: MAIN_HWND==0\n"),
+        );
+        return;
+    }
+    let hwnd = raw as *mut core::ffi::c_void;
+    let prev = unsafe {
+        SetWindowLongPtrW(
+            hwnd,
+            GWLP_WNDPROC,
+            bell_wndproc as isize,
+        )
+    };
+    ORIG_WNDPROC.store(prev as isize, Ordering::Relaxed);
+    let _ = std::fs::write(
+        "subclass.log",
+        format!("installed: hwnd={raw:#x} prev_wndproc={prev:#x}\n"),
+    );
+}
+
+#[cfg(not(windows))]
+fn install_minimize_intercept() {}
+
 /// 把标题栏强制设为浅色（与界面的浅色主题一致）。
 ///
 /// 为什么需要：升级到 eframe 0.37（egui-winit 0.37）后，标题栏变成深色，而界面是
@@ -660,6 +752,7 @@ fn remember_main_hwnd(cc: &eframe::CreationContext<'_>) {
     #[cfg(windows)]
     if let Some(hwnd) = window_hwnd(cc) {
         MAIN_HWND.store(hwnd as isize, std::sync::atomic::Ordering::Relaxed);
+        install_minimize_intercept();
     }
 }
 
@@ -2398,6 +2491,13 @@ impl eframe::App for PlanApp {
         // 另一个进程双击了 exe → 把窗口调出来
         if SHOW_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.show_main_window(ctx);
+        }
+
+        // 标题栏「最小化」按钮被拦截（bell_wndproc）→ 转为「隐藏到托盘」。
+        // 动机与原理见 bell_wndproc 文档：真最小化会让客户区变 0×0，
+        // 在其上强制渲染（RequestPaintWhileHidden）已实测触发崩溃。
+        if MINIMIZE_REQUESTED.swap(false, Ordering::SeqCst) {
+            self.hide_main_window(ctx);
         }
 
         self.tick(ctx);

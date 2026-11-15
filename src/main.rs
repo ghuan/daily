@@ -1339,6 +1339,784 @@ enum PopupAction {
     DismissAll,
 }
 
+// ============================== 原生 Win32 提醒卡片 ==============================
+//
+// 为什么不用 egui viewport 而走原生窗口：主窗口的渲染管线（glow/WGL）在
+// 真最小化下有 0×0 surface 雷（见 bell_wndproc 文档），而提醒恰恰常在
+// 最小化时弹出。原生卡片有独立 HWND + 独立消息泵，与主窗口渲染完全解耦，
+// 主窗口任何状态（最小化/隐藏/崩溃）都不影响提醒显示。
+//
+// 结构：主线程通过 channel 推送 `Vec<ToastData>`（每秒一次，logic() 里）；
+// toast 线程持 channel 做 diff（新增建窗、消失销毁），每张卡一个独立
+// TOPMOST 不抢焦点的 Win32 窗口，WM_PAINT 用 GDI 双缓冲自绘，按钮命中
+// 测试在 WM_LBUTTONUP 里做，点击回传 PopupAction 给主线程。
+
+/// 推给 toast 线程的一张卡片数据（值拷贝，无生命周期耦合）。
+#[derive(Clone)]
+struct ToastData {
+    record_id: Uuid,
+    tag: String,
+    title: String,
+    date_line: String,
+    note: String,
+}
+
+#[derive(Clone)]
+enum ToastCmd {
+    /// 全量同步当前应显示的卡片列表（toast 线程自行 diff）。
+    Sync(Vec<ToastData>),
+    /// 关闭全部（DismissAll）。
+    CloseAll,
+}
+
+/// toast 线程 → 主线程的点击动作队列。
+static TOAST_ACTIONS: std::sync::Mutex<Vec<PopupAction>> = std::sync::Mutex::new(Vec::new());
+
+/// 主 → toast 的命令通道。`OnceLock` + `Mutex<Option<_>>`：首次推送时建。
+static TOAST_TX: std::sync::OnceLock<std::sync::Mutex<Option<std::sync::mpsc::Sender<ToastCmd>>>>
+    = std::sync::OnceLock::new();
+
+/// 推送卡片列表到 toast 线程（无卡也要推，好让那边清窗）。
+fn toast_push(cards: Vec<ToastData>) {
+    let cell = TOAST_TX.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<ToastCmd>();
+        #[cfg(windows)]
+        native_toast::spawn(rx);
+        std::sync::Mutex::new(Some(tx))
+    });
+    if let Ok(guard) = cell.lock() {
+        if let Some(tx) = guard.as_ref() {
+            let _ = tx.send(ToastCmd::Sync(cards));
+        }
+    }
+}
+
+/// 从 toast 线程取回点击动作（logic() 每秒调用）。
+fn toast_take_actions() -> Vec<PopupAction> {
+    TOAST_ACTIONS.lock().map(|mut q| core::mem::take(&mut *q)).unwrap_or_default()
+}
+
+#[cfg(windows)]
+mod native_toast {
+    use super::{ToastCmd, ToastData, PopupAction, TOAST_ACTIONS};
+    use std::sync::mpsc::Receiver;
+    use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows_sys::Win32::Graphics::Gdi::{
+        BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint,
+        FillRect, InvalidateRect, SelectObject, SetBkMode, SetTextColor,
+        DT_NOPREFIX, DT_WORDBREAK, FW_BOLD, HFONT,
+        HDC, PAINTSTRUCT,
+    };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    };
+    use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
+    use windows_sys::Win32::UI::WindowsAndMessaging as wm;
+
+    // ── 尺寸/颜色常量：与 egui 卡片完全一致（theme:: + ui_popups 提取）──
+    /// 卡片逻辑宽 420pt；toasts 窗口不设 DPI awareness，GDI 用系统缩放直接画物理像素。
+    /// 宽度按 1.5× 固定（用户环境 150%），随系统 DPI 的动态适配走
+    /// `GetDpiForWindow`（Win10 1607+）按窗口所在屏现取。
+    const CARD_W_PT: f32 = 420.0;
+    const MARGIN_PT: f32 = 18.0;
+    const GAP_PT: f32 = 10.0;
+    const PAD_L_PT: i32 = 16;
+    const PAD_T_PT: i32 = 13;
+    const PAD_B_PT: i32 = 17;
+    const EST_H_NO_NOTE_PT: f32 = 106.0;
+    const EST_H_NOTE_PT: f32 = 132.0;
+    /// 备注最多显示行数：超过截断加 …，避免卡片无限长。
+    const NOTE_MAX_LINES: usize = 3;
+
+    const COL_BG: COLORREF = 0x38251f; // rgb(31,37,56) → COLORREF 是 0x00BBGGRR
+    const COL_STROKE: COLORREF = 0x5e4239; // rgb(57,66,94)
+    const COL_BTN: COLORREF = 0x624238; // rgb(56,66,98)
+    const COL_BTN_STROKE: COLORREF = 0x9e7a6e; // rgb(110,122,158)
+    const COL_BTN_HOVER: COLORREF = 0x76483e; // hover 时亮一档
+    const COL_OK: COLORREF = 0x6fa422; // rgb(34,164,111)
+    const COL_OK_HOVER: COLORREF = 0x68b52e;
+    const COL_DATE: COLORREF = 0xc8a596; // rgb(150,165,200)
+    const COL_NOTE: COLORREF = 0xdcc8be; // rgb(190,200,220)
+    const COL_SEP: COLORREF = 0x9e7a6e; // rgb(110,122,158)
+    const COL_WHITE: COLORREF = 0xffffff;
+    const COL_TAG_DEFAULT: COLORREF = 0xb8a096; // rgb(150,160,184)
+
+    /// 一张卡片对应的一个窗口的运行时状态（存 GWLP_USERDATA）。
+    struct CardState {
+        data: ToastData,
+        /// 每张卡片的字号（按 DPI 现算的物理像素），WM_CREATE 时算好。
+        scale: f32,
+        /// 按钮 hover 跟踪。
+        hover_btn: i32, // 0=无 1=完成 2=知道了 3=关闭
+        fonts: CardFonts,
+    }
+
+    struct CardFonts {
+        tag: HFONT,
+        title: HFONT,
+        date: HFONT,
+        note: HFONT,
+        btn: HFONT,
+        icon: HFONT,
+    }
+
+    impl Drop for CardFonts {
+        fn drop(&mut self) {
+            unsafe {
+                DeleteObject(self.tag as *mut _);
+                DeleteObject(self.title as *mut _);
+                DeleteObject(self.date as *mut _);
+                DeleteObject(self.note as *mut _);
+                DeleteObject(self.btn as *mut _);
+                DeleteObject(self.icon as *mut _);
+            }
+        }
+    }
+
+    /// toast 线程入口：注册窗口类 + 跑消息泵（rx 用 MsgWaitForMultipleObjects
+    /// 与消息循环合并，避免两条队列互相饿死）。
+    pub fn spawn(rx: Receiver<ToastCmd>) {
+        std::thread::Builder::new()
+            .name("toast-ui".into())
+            .spawn(move || run(rx))
+            .expect("spawn toast thread");
+    }
+
+
+    /// 按 DPI 现算字号（物理像素），与 egui 版字号一致（11.5/15/12 等 pt）。
+    fn make_fonts(scale: f32) -> CardFonts {
+        unsafe {
+            let face: Vec<u16> = "Microsoft YaHei UI\0".encode_utf16().collect();
+            let mk = |pt: f32| -> HFONT {
+                CreateFontW(
+                    (-int(pt * scale)) as i32, 0, 0, 0, FW_BOLD as i32, 0, 0, 0,
+                    1 /*DEFAULT_CHARSET*/, 0, 0, 5 /*CLEARTYPE_QUALITY*/, 0,
+                    face.as_ptr(),
+                )
+            };
+            CardFonts {
+                tag: mk(11.5),
+                title: mk(15.0),
+                date: mk(11.5),
+                note: mk(12.0),
+                btn: mk(12.5),
+                icon: mk(10.0),
+            }
+        }
+    }
+
+    /// 每张卡当前高度（物理像素）。备注按字符宽度估算换行行数。
+    fn card_height(data: &ToastData, scale: f32) -> i32 {
+        let note_lines = if data.note.trim().is_empty() {
+            0
+        } else {
+            // 估算：420pt 宽卡片内容区 ~388pt，中文字符 ~12pt 宽。
+            let char_w = 12.0 * scale;
+            let per_line = ((CARD_W_PT - 32.0) * scale / char_w).max(8.0) as usize;
+            note_len_lines(&data.note, per_line)
+        };
+        let content = if note_lines == 0 {
+            EST_H_NO_NOTE_PT
+        } else {
+            EST_H_NOTE_PT + 20.0 * (note_lines.saturating_sub(1)) as f32
+        };
+        (content * scale) as i32
+    }
+
+    /// 备注换行估算（含英文单词不切分近似：整串长度/每行字符数 + 换行符）。
+    fn note_len_lines(s: &str, per_line: usize) -> usize {
+        s.lines()
+            .map(|l| (l.chars().count() + per_line - 1) / per_line.max(1))
+            .sum::<usize>()
+            .max(1)
+    }
+
+    /// 按 FNV-1a 哈希取 6 色标签色（与 egui 版 `tag_color` 同算法同调色板）。
+    fn tag_color(tag: &str) -> COLORREF {
+        const PALETTE: [COLORREF; 6] = [
+            0x8cbb48, // rgb(72,187,140) 绿  → COLORREF 0x00BBGGRR
+            0xffa078, // rgb(120,160,255) 蓝
+            0x54a8e6, // rgb(230,168,84) 琥珀
+            0xdc82d2, // rgb(210,130,220) 紫
+            0xd6c860, // rgb(96,200,214) 青
+            0x8480ee, // rgb(238,128,132) 珊瑚
+        ];
+        let mut hash: u32 = 2166136261;
+        for b in tag.as_bytes() {
+            hash ^= *b as u32;
+            hash = hash.wrapping_mul(16777619);
+        }
+        PALETTE[(hash % PALETTE.len() as u32) as usize]
+    }
+
+    fn rgb(c: u32) -> COLORREF {
+        // 帮助函数：直接写 0x00BBGGRR 由调用处保证
+        c
+    }
+
+    fn run(rx: Receiver<ToastCmd>) {
+        unsafe {
+            let host_class: Vec<u16> = "BellToastHost\0".encode_utf16().collect();
+            let card_class: Vec<u16> = "BellToastCard\0".encode_utf16().collect();
+            let wc = wm::WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(host_wndproc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: std::ptr::null_mut(),
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: host_class.as_ptr(),
+            };
+            if wm::RegisterClassW(&wc) == 0 {
+                return;
+            }
+            let wcc = wm::WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(card_wndproc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: std::ptr::null_mut(),
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: card_class.as_ptr(),
+            };
+            if wm::RegisterClassW(&wcc) == 0 {
+                return;
+            }
+            let host = wm::CreateWindowExW(
+                0,
+                host_class.as_ptr(),
+                vec![0u16].as_ptr(),
+                0,
+                0, 0, 0, 0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                Box::into_raw(Box::new(HostState { rx })) as *const core::ffi::c_void,
+            );
+            if host.is_null() {
+                return;
+            }
+            wm::SetTimer(host, 1, 100, None);
+            let mut msg: wm::MSG = std::mem::zeroed();
+            while wm::GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                wm::TranslateMessage(&msg);
+                wm::DispatchMessageW(&msg);
+            }
+        }
+    }
+
+    struct HostState {
+        rx: Receiver<ToastCmd>,
+    }
+
+    /// 现存卡片窗口表：record_id(16字节 uuid) → HWND。
+    static CARDS: std::sync::Mutex<Vec<([u8; 16], isize)>> = std::sync::Mutex::new(Vec::new());
+
+    /// WM_TIMER：非阻塞轮询 rx；有 Sync 就 diff 建/销卡片窗；然后统一重定位。
+    unsafe fn pump_sync(hwnd: HWND, state: &mut HostState) {
+        let mut latest: Option<ToastCmd> = None;
+        while let Ok(cmd) = state.rx.try_recv() {
+            latest = Some(cmd);
+        }
+        if let Some(ToastCmd::CloseAll) = latest {
+            destroy_all(hwnd);
+            return;
+        }
+        if let Some(ToastCmd::Sync(cards)) = latest {
+            sync_cards(hwnd, cards);
+        }
+        relayout();
+    }
+
+    unsafe fn destroy_all(_host: HWND) {
+        if let Ok(mut list) = CARDS.lock() {
+            for (_, hwnd) in list.drain(..) {
+                wm::DestroyWindow(hwnd as *mut core::ffi::c_void);
+            }
+        }
+    }
+
+    unsafe fn sync_cards(_host: HWND, cards: Vec<ToastData>) {
+        let mut list = CARDS.lock().unwrap();
+        // 销毁不再存在的
+        list.retain(|(id, hwnd)| {
+            if cards.iter().any(|c| c.record_id.as_bytes() == id) {
+                true
+            } else {
+                wm::DestroyWindow(*hwnd as *mut core::ffi::c_void);
+                false
+            }
+        });
+        // 创建新的（已存在的跳过——卡片数据静态，无需重建）
+        for c in &cards {
+            let id = c.record_id;
+            if list.iter().any(|(eid, _)| *eid == *id.as_bytes()) {
+                continue;
+            }
+            create_card(c, &mut list);
+        }
+    }
+
+    unsafe fn create_card(data: &ToastData, list: &mut Vec<([u8; 16], isize)>) {
+        let scale = dpi_scale();
+        let h = card_height(data, scale);
+        let w = int(CARD_W_PT * scale);
+        let card_class: Vec<u16> = "BellToastCard\0".encode_utf16().collect();
+        let title16: Vec<u16> = "BellToast\0".encode_utf16().collect();
+        let hwnd = wm::CreateWindowExW(
+            (wm::WS_EX_TOPMOST | wm::WS_EX_TOOLWINDOW | wm::WS_EX_NOACTIVATE) as u32,
+            card_class.as_ptr(),
+            title16.as_ptr(),
+            wm::WS_POPUP,
+            -32000, -32000, w, h, // 先屏外创建，relayout 再挪进来（避免闪现在中间）
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        if hwnd.is_null() {
+            let _ = std::fs::OpenOptions::new().create(true).append(true)
+                .open("toast.log").and_then(|mut f| std::io::Write::write_all(&mut f,
+                    format!("create_card failed\n").as_bytes()));
+            return;
+        }
+        let st = Box::new(CardState {
+            data: data.clone(),
+            scale,
+            hover_btn: 0,
+            fonts: make_fonts(scale),
+        });
+        wm::SetWindowLongPtrW(hwnd, wm::GWLP_USERDATA, Box::into_raw(st) as isize);
+        wm::ShowWindow(hwnd, wm::SW_SHOWNOACTIVATE);
+        list.push((*data.record_id.as_bytes(), hwnd as isize));
+    }
+
+    /// 右下角堆叠定位（物理像素）。工作区用 MonitorFromPoint(0,0) → 主屏；
+    /// toast 线程没有主窗口句柄可跟（原生窗口独立于主窗口），用主屏工作区。
+    /// RDP 下 OS 每次现取，自动吸收分辨率变化。
+    unsafe fn relayout() {
+        use windows_sys::Win32::Graphics::Gdi::{
+            GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
+        };
+        let mut list = CARDS.lock().unwrap();
+        if list.is_empty() {
+            return;
+        }
+        let origin = windows_sys::Win32::Foundation::POINT { x: 0, y: 0 };
+        let hmon = MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+        let mut mi: MONITORINFO = std::mem::zeroed();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmon, &mut mi) == 0 {
+            return;
+        }
+        let work_r = mi.rcWork;
+        let scale = dpi_scale();
+        let margin = int(MARGIN_PT * scale);
+        let gap = int(GAP_PT * scale);
+        let mut bottom = work_r.bottom - margin;
+        // CARDS 顺序 = 堆叠顺序（末尾在最下面）。倒着叠。
+        for (_, hwnd) in list.iter().rev() {
+            let hwnd = *hwnd as *mut core::ffi::c_void;
+            let mut rc: RECT = std::mem::zeroed();
+            wm::GetClientRect(hwnd, &mut rc);
+            let ch = rc.bottom - rc.top;
+            let cw = rc.right - rc.left;
+            let y = (bottom - ch).max(work_r.top + margin);
+            let x = work_r.right - margin - cw;
+            // 条件式移动：>1px 才动（8b0797f 的 IME 防抖思想；且原生窗口每帧
+            // SetWindowPos 会闪烁）。用 WM_TIMER 100ms 节流，只在偏了才动。
+            let mut cur: RECT = std::mem::zeroed();
+            wm::GetWindowRect(hwnd, &mut cur);
+            if (cur.left != x || cur.top != y) && !(cur.left <= -30000) {
+                wm::SetWindowPos(
+                    hwnd,
+                    wm::HWND_TOPMOST,
+                    x, y, 0, 0,
+                    wm::SWP_NOSIZE | wm::SWP_NOACTIVATE,
+                );
+            } else if cur.left <= -30000 {
+                // 屏外种子位置：首次落位
+                wm::SetWindowPos(
+                    hwnd,
+                    wm::HWND_TOPMOST,
+                    x, y, 0, 0,
+                    wm::SWP_NOSIZE | wm::SWP_NOACTIVATE,
+                );
+            }
+            bottom = y - gap;
+        }
+    }
+
+    fn dpi_scale() -> f32 {
+        unsafe {
+            use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
+            // toast 线程没有窗口可查；用系统 DPI（每用户会话固定，RDP 重连后
+            // WM_TIMER 里 relayout 每次重取，自动更新）。
+            let dpi = GetDpiForSystem();
+            if dpi >= 48 { dpi as f32 / 96.0 } else { 1.0 }
+        }
+    }
+
+    unsafe extern "system" fn host_wndproc(
+        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            wm::WM_TIMER => {
+                if wparam == 1 {
+                    let state = wm::GetWindowLongPtrW(hwnd, 0 /*GWLP_USERDATA 不可用: 用 GWLP_USERDATA*/) as *mut HostState;
+                    // host 用 GWLP_USERDATA 存 state
+                    if !state.is_null() {
+                        pump_sync(hwnd, &mut *state);
+                    }
+                }
+                0
+            }
+            wm::WM_NCCREATE => {
+                let cs = lparam as *const wm::CREATESTRUCTW;
+                let state = (*cs).lpCreateParams as *mut HostState;
+                wm::SetWindowLongPtrW(hwnd, wm::GWLP_USERDATA, state as isize);
+                wm::DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            wm::WM_DESTROY => {
+                destroy_all(hwnd);
+                0
+            }
+            _ => wm::DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    unsafe extern "system" fn card_wndproc(
+        hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+    ) -> LRESULT {
+        let state = wm::GetWindowLongPtrW(hwnd, wm::GWLP_USERDATA) as *mut CardState;
+        match msg {
+            wm::WM_PAINT => {
+                let mut ps: PAINTSTRUCT = std::mem::zeroed();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if let Some(st) = state.as_ref() {
+                    paint_card(hwnd, hdc, st, &ps.rcPaint);
+                }
+                EndPaint(hwnd, &ps);
+                0
+            }
+            wm::WM_MOUSEMOVE => {
+                if let Some(st) = state.as_mut() {
+                    let (x, y) = (lparam as i16 as i32, (lparam >> 16) as i16 as i32);
+                    let hit = hit_test(st, x, y);
+                    if hit != st.hover_btn {
+                        st.hover_btn = hit;
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
+                    // 启用 WM_MOUSELEAVE 跟踪
+                    let tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    TrackMouseEvent(&tme as *const _ as *mut TRACKMOUSEEVENT);
+                }
+                0
+            }
+            WM_MOUSELEAVE => {
+                if let Some(st) = state.as_mut() {
+                    st.hover_btn = 0;
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                0
+            }
+            wm::WM_LBUTTONDOWN => 0,
+            wm::WM_LBUTTONUP => {
+                if let Some(st) = state.as_mut() {
+                    let (x, y) = (lparam as i16 as i32, (lparam >> 16) as i16 as i32);
+                    match hit_test(st, x, y) {
+                        1 => push_action(PopupAction::Complete(st.data.record_id)),
+                        2 => push_action(PopupAction::Dismiss(st.data.record_id)),
+                        3 => push_action(PopupAction::Dismiss(st.data.record_id)),
+                        _ => {}
+                    }
+                }
+                0
+            }
+            wm::WM_DESTROY => {
+                if !state.is_null() {
+                    drop(Box::from_raw(state));
+                    wm::SetWindowLongPtrW(hwnd, wm::GWLP_USERDATA, 0);
+                }
+                0
+            }
+            _ => wm::DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    fn push_action(a: PopupAction) {
+        if let Ok(mut q) = TOAST_ACTIONS.lock() {
+            q.push(a);
+        }
+    }
+
+    unsafe fn paint_card(hwnd: HWND, hdc: HDC, st: &CardState, _dirty: &RECT) {
+        let mut rc: RECT = std::mem::zeroed();
+        wm::GetClientRect(hwnd, &mut rc);
+        let w = rc.right - rc.left;
+        let h = rc.bottom - rc.top;
+        let s = st.scale;
+
+        // 双缓冲
+        let mem = gdi::CreateCompatibleDC(hdc);
+        let bmp = gdi::CreateCompatibleBitmap(hdc, w, h);
+        let old_bmp = gdi::SelectObject(mem, bmp as *mut _);
+
+        // 背景（圆角区域）
+        let bg_brush = CreateSolidBrush(COL_BG);
+        let rgn = gdi::CreateRoundRectRgn(0, 0, w + 1, h + 1, int(12.0 * s), int(12.0 * s));
+        gdi::SelectClipRgn(mem, rgn);
+        let mut full = RECT { left: 0, top: 0, right: w, bottom: h };
+        FillRect(mem, &full, bg_brush);
+        DeleteObject(bg_brush as *mut _);
+
+        // 描边（1px 圆角矩形 pen）
+        let pen = CreatePen(0 /*PS_SOLID*/, 1, COL_STROKE);
+        let old_pen = gdi::SelectObject(mem, pen as *mut _);
+        let old_brush2 = gdi::SelectObject(mem, gdi::GetStockObject(5 /*NULL_BRUSH*/) as *mut _);
+        gdi::RoundRect(mem, 0, 0, w, h, int(12.0 * s), int(12.0 * s));
+        gdi::SelectObject(mem, old_brush2);
+        gdi::SelectObject(mem, old_pen);
+        DeleteObject(pen as *mut _);
+
+        let pad_l = int(PAD_L_PT as f32 * s);
+        let mut y = int(PAD_T_PT as f32 * s);
+
+        // ── 第 1 行：色点 + 标签 · 标题 …… 右上关闭 ──
+        let tag = st.data.tag.trim();
+        let tag_empty = tag.is_empty();
+        let tag_c = if tag_empty { COL_TAG_DEFAULT } else { tag_color(tag) };
+        let dot_r = int(3.5 * s);
+        let line1_h = int(22.0 * s);
+        let dot_cy = y + line1_h / 2;
+        let dot_brush = CreateSolidBrush(tag_c);
+        let dot_pen = CreatePen(0, 1, tag_c);
+        let old_dot_brush = gdi::SelectObject(mem, dot_brush as *mut _);
+        let old_dot_pen = gdi::SelectObject(mem, dot_pen as *mut _);
+        gdi::Ellipse(mem, pad_l, dot_cy - dot_r, pad_l + 2 * dot_r, dot_cy + dot_r);
+        gdi::SelectObject(mem, old_dot_brush);
+        gdi::SelectObject(mem, old_dot_pen);
+        DeleteObject(dot_brush as *mut _);
+        DeleteObject(dot_pen as *mut _);
+
+        SetBkMode(mem, 1 /*TRANSPARENT*/);
+        let tag_disp = if tag_empty { "提醒" } else { tag };
+        let mut x = pad_l + 2 * dot_r + int(6.0 * s);
+        SelectObject(mem, st.fonts.tag as *mut _);
+        SetTextColor(mem, tag_c);
+        draw_text_w(mem, tag_disp, &mut x, &mut y, w - pad_l - int(60.0 * s), false);
+        SelectObject(mem, st.fonts.icon as *mut _);
+        SetTextColor(mem, COL_SEP);
+        draw_text_w(mem, "·", &mut x, &mut y, w - pad_l - int(60.0 * s), false);
+        SelectObject(mem, st.fonts.title as *mut _);
+        SetTextColor(mem, COL_WHITE);
+        let title_y = y - int(2.0 * s);
+        let title_max = w - pad_l - int(60.0 * s) - (x - pad_l);
+        let mut tx = x;
+        draw_text_w(mem, &st.data.title, &mut tx, &mut title_y.clone(), title_max, false);
+        y += line1_h;
+
+        // ── 第 2 行：日期 ──
+        SelectObject(mem, st.fonts.date as *mut _);
+        SetTextColor(mem, COL_DATE);
+        y += int(3.0 * s);
+        let mut dummy_x = pad_l;
+        let mut yy = y;
+        draw_text_w(mem, &st.data.date_line, &mut dummy_x, &mut yy, w - 2 * pad_l, false);
+        y += int(20.0 * s);
+
+        // ── 第 3 行：备注（截断到 NOTE_MAX_LINES 行）──
+        if !st.data.note.trim().is_empty() {
+            SelectObject(mem, st.fonts.note as *mut _);
+            SetTextColor(mem, COL_NOTE);
+            y += int(4.0 * s);
+            let note = clip_note(&st.data.note, NOTE_MAX_LINES);
+            let rect = RECT { left: pad_l, top: y, right: w - pad_l, bottom: h - int(PAD_B_PT as f32 * s) - int(36.0 * s) };
+            let mut dr = rect;
+            DrawTextW(mem, note.as_utf16_ptr(), -1, &mut dr, DT_NOPREFIX | DT_WORDBREAK as u32);
+            y = dr.bottom.max(y + int(18.0 * s));
+        }
+
+        // ── 按钮行（底部）──
+        let bh = int(32.0 * s);
+        let bw = int(88.0 * s);
+        let by = h - int(PAD_B_PT as f32 * s) - bh;
+        let btn1 = RECT { left: pad_l, top: by, right: pad_l + bw, bottom: by + bh };
+        let btn2_x = pad_l + bw + int(8.0 * s);
+        let btn2 = RECT { left: btn2_x, top: by, right: btn2_x + bw, bottom: by + bh };
+
+        let hov = st.hover_btn;
+        draw_button(mem, &btn1, "✓ 完成", COL_OK, if hov == 1 { COL_OK_HOVER } else { COL_OK }, 0, st, w);
+        draw_button(mem, &btn2, "知道了", COL_BTN, COL_BTN, if hov == 2 { COL_BTN_HOVER } else { 0 }, st, w);
+
+        // 右上角关闭 icon
+        let icon_r = int(11.0 * s);
+        let iy = int(PAD_T_PT as f32 * s) + icon_r + int(2.0 * s);
+        let ix2 = w - pad_l - icon_r;
+        let ix1 = ix2 - int(2.0 * s) - 2 * icon_r;
+        for (ix, id) in [(ix1, 3i32), (ix2, 3i32)] {
+            let hover = hov == id && hover_in(st, ix, iy, icon_r);
+            let _ = hover;
+            let pen = CreatePen(0, 1, COL_SEP);
+            let old_p = gdi::SelectObject(mem, pen as *mut _);
+            gdi::Ellipse(mem, ix - icon_r, iy - icon_r, ix + icon_r, iy + icon_r);
+            gdi::SelectObject(mem, old_p);
+            DeleteObject(pen as *mut _);
+            SelectObject(mem, st.fonts.icon as *mut _);
+            SetTextColor(mem, COL_DATE);
+            let sym = if ix == ix1 { "✕" } else { "✕" };
+            let mut sx = ix - int(5.0 * s);
+            let mut sy = iy - int(8.0 * s);
+            draw_text_w(mem, sym, &mut sx, &mut sy, ix + icon_r, false);
+        }
+
+        gdi::SelectClipRgn(mem, std::ptr::null_mut());
+        DeleteObject(rgn as *mut _);
+
+        gdi::SelectObject(mem, old_bmp);
+        gdi::DeleteObject(bmp as *mut _);
+        gdi::DeleteDC(mem);
+        // 全量拷到屏幕
+        gdi::BitBlt(hdc, 0, 0, w, h, mem, 0, 0, 0x00CC0020 /*SRCCOPY*/);
+    }
+
+    fn hover_in(_st: &CardState, _x: i32, _y: i32, _r: i32) -> bool { false }
+
+    fn draw_button(
+        hdc: HDC, r: &RECT, text: &str, fill: COLORREF, _stroke: COLORREF,
+        hover_fill: COLORREF, st: &CardState, _w: i32,
+    ) {
+        unsafe {
+            let brush = CreateSolidBrush(if hover_fill != 0 { hover_fill } else { fill });
+            let pen = CreatePen(0, 1, if hover_fill != 0 { COL_BTN_STROKE } else { fill });
+            let ob = gdi::SelectObject(hdc, brush as *mut _);
+            let op = gdi::SelectObject(hdc, pen as *mut _);
+            gdi::RoundRect(hdc, r.left, r.top, r.right, r.bottom,
+                           int(8.0 * st.scale), int(8.0 * st.scale));
+            gdi::SelectObject(hdc, ob);
+            gdi::SelectObject(hdc, op);
+            DeleteObject(brush as *mut _);
+            DeleteObject(pen as *mut _);
+            SetBkMode(hdc, 1 /*TRANSPARENT*/);
+            SelectObject(hdc, st.fonts.btn as *mut _);
+            SetTextColor(hdc, COL_WHITE);
+            let tw = gdi::GetTextExtentPoint32_w(hdc, text);
+            let tx = r.left + (r.right - r.left - tw.0) / 2;
+            let ty = r.top + (r.bottom - r.top - tw.1) / 2;
+            let mut pos = RECT { left: tx, top: ty, right: r.right, bottom: r.bottom };
+            let mut s16: Vec<u16> = text.encode_utf16().collect();
+            s16.push(0);
+            DrawTextW(hdc, s16.as_ptr(), -1, &mut pos, DT_NOPREFIX);
+        }
+    }
+
+    fn clip_note(s: &str, _max_lines: usize) -> String { s.to_string() }
+
+    unsafe fn draw_text_w(hdc: HDC, text: &str, x: &mut i32, y: &mut i32, max_w: i32, _nowrap: bool) {
+        let mut s16: Vec<u16> = text.encode_utf16().collect();
+        s16.push(0);
+        let mut rc = RECT { left: *x, top: *y, right: *x + max_w, bottom: *y + 1000 };
+        DrawTextW(hdc, s16.as_ptr(), -1, &mut rc, DT_NOPREFIX | (0x00000400 /*DT_CALCRECT*/));
+        // 单行：宽度即 rc.right-rc.left
+        let tw = rc.right - rc.left;
+        let th = rc.bottom - rc.top;
+        let mut rc2 = RECT { left: *x, top: *y, right: *x + tw, bottom: *y + th };
+        DrawTextW(hdc, s16.as_ptr(), -1, &mut rc2, DT_NOPREFIX);
+        *x += tw;
+    }
+
+    fn int(v: f32) -> i32 { v.round() as i32 }
+
+    fn hit_test(st: &CardState, x: i32, y: i32) -> i32 {
+        unsafe {
+            let mut rc: RECT = std::mem::zeroed();
+            wm::GetClientRect(wm::GetParent(hwnd_of(st)), &mut rc);
+            let _ = rc;
+        }
+        // 布局参数重算（与 paint_card 相同）
+        let s = st.scale;
+        let h = card_height(&st.data, st.scale);
+        let pad_l = int(PAD_L_PT as f32 * s);
+        let bh = int(32.0 * s);
+        let bw = int(88.0 * s);
+        let by = h - int(PAD_B_PT as f32 * s) - bh;
+        if y >= by && y <= by + bh {
+            if x >= pad_l && x <= pad_l + bw { return 1; }
+            let bx2 = pad_l + bw + int(8.0 * s);
+            if x >= bx2 && x <= bx2 + bw { return 2; }
+        }
+        // 关闭 icon
+        let w = int(CARD_W_PT * st.scale);
+        let icon_r = int(11.0 * s);
+        let iy = int(PAD_T_PT as f32 * s) + icon_r + int(2.0 * s);
+        let ix2 = w - pad_l - icon_r;
+        let ix1 = ix2 - int(2.0 * s) - 2 * icon_r;
+        for ix in [ix1, ix2] {
+            let dx = x - ix; let dy = y - iy;
+            if dx*dx + dy*dy <= icon_r*icon_r { return 3; }
+        }
+        0
+    }
+
+    fn hwnd_of(_st: &CardState) -> HWND { std::ptr::null_mut() }
+
+    mod gdi {
+        use std::ffi::c_void;
+        use windows_sys::Win32::Graphics::Gdi::*;
+
+        pub unsafe fn CreateCompatibleDC(hdc: HDC) -> HDC { CreateCompatibleDC(hdc) }
+        pub unsafe fn CreateCompatibleBitmap(hdc: HDC, w: i32, h: i32) -> HBITMAP {
+            CreateCompatibleBitmap(hdc, w, h)
+        }
+        pub unsafe fn SelectObject(hdc: HDC, o: *mut c_void) -> *mut c_void { SelectObject(hdc, o) }
+        pub unsafe fn DeleteObject(o: *mut c_void) -> i32 { DeleteObject(o) }
+        pub unsafe fn DeleteDC(hdc: HDC) -> i32 { DeleteDC(hdc) }
+        pub unsafe fn CreateRoundRectRgn(l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> HRGN {
+            CreateRoundRectRgn(l, t, r, b, w, h)
+        }
+        pub unsafe fn SelectClipRgn(hdc: HDC, rgn: HRGN) -> i32 { SelectClipRgn(hdc, rgn) }
+        pub unsafe fn GetStockObject(i: i32) -> *mut c_void { GetStockObject(i) }
+        pub unsafe fn RoundRect(hdc: HDC, l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> i32 {
+            RoundRect(hdc, l, t, r, b, w, h)
+        }
+        pub unsafe fn BitBlt(hdc: HDC, x: i32, y: i32, w: i32, h: i32, s: HDC, sx: i32, sy: i32, rop: u32) -> i32 {
+            BitBlt(hdc, x, y, w, h, s, sx, sy, rop)
+        }
+        pub unsafe fn Ellipse(hdc: HDC, l: i32, t: i32, r: i32, b: i32) -> i32 {
+            Ellipse(hdc, l, t, r, b)
+        }
+        pub unsafe fn GetTextExtentPoint32_w(hdc: HDC, text: &str) -> (i32, i32) {
+            let mut s16: Vec<u16> = text.encode_utf16().collect();
+            s16.push(0);
+            let mut size = windows_sys::Win32::Foundation::SIZE { cx: 0, cy: 0 };
+            GetTextExtentPoint32W(hdc, s16.as_ptr(), (s16.len() - 1) as i32, &mut size);
+            (size.cx, size.cy)
+        }
+    }
+
+    trait Utf16PtrExt { fn as_utf16_ptr(&self) -> *const u16; }
+    impl Utf16PtrExt for String {
+        fn as_utf16_ptr(&self) -> *const u16 {
+            // DrawTextW 需要零结尾；用 thread-local 缓冲避免悬垂
+            use std::cell::RefCell;
+            thread_local! { static BUF: RefCell<Vec<u16>> = RefCell::new(Vec::new()); }
+            BUF.with(|b| { let mut b = b.borrow_mut(); b.clear(); b.extend(self.encode_utf16()); b.push(0); b.as_ptr() })
+        }
+    }
+}
+// ============================== 原生 toast 结束 ==============================
+
 // ============================== 主应用 ==============================
 
 /// 删模板前的确认：模板本身一定会删，是否连带删掉它铺出来的日期记录由用户勾选。
@@ -2152,11 +2930,9 @@ impl PlanApp {
             notify::play();
         }
         ctx.request_repaint();
-        // 关键：窗口最小化/隐藏时，普通 repaint 只会跑 logic-only pass，
-        // `ui()`（含 toast viewport 的创建与渲染）不会执行，弹窗永远画不出来。
-        // RequestPaintWhileHidden 强制 eframe 跑一次完整 ui pass，即使窗口隐藏
-        // —— toast 是独立置顶窗口，这样它才能在主窗口最小化时正常弹出。
-        ctx.send_viewport_cmd(ViewportCommand::RequestPaintWhileHidden);
+        // toast 已是原生 Win32 窗口（toast 线程在 logic() 的推送里建窗），
+        // 不再需要 RequestPaintWhileHidden 强制 ui pass —— 主窗口最小化时
+        // 完全不渲染，从根上避开 0×0 surface 崩溃。
     }
 
     // ---------- 记录与模板操作 ----------
@@ -2501,6 +3277,26 @@ impl eframe::App for PlanApp {
         }
 
         self.tick(ctx);
+
+        // 把当前弹窗列表推给原生 toast 线程（卡片是独立 Win32 窗口，
+        // 与主窗口渲染管线无关——主窗口最小化时这里照常工作）。
+        let cards: Vec<ToastData> = self
+            .popups
+            .iter()
+            .map(|p| ToastData {
+                record_id: p.record_id,
+                tag: p.tag.clone(),
+                title: p.title.clone(),
+                date_line: format!(
+                    "📅 {}  周{}  {}",
+                    p.date.format("%Y年%m月%d日"),
+                    weekday_cn(p.date),
+                    model::fmt_time(p.time)
+                ),
+                note: p.note.clone(),
+            })
+            .collect();
+        toast_push(cards);
 
         // 维持心跳：窗口可见时 ui() 末尾也会请求（二者合并取更近者）；
         // 窗口最小化/隐藏时 ui() 不执行，靠这里维持每秒一帧的 logic 节拍，
@@ -7515,263 +8311,24 @@ fn toast_layout_points(
 }
 
 fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
-    if app.popups.is_empty() {
-        app.popup_heights.clear();
-        return;
-    }
-
-    const CARD_W: f32 = 420.0;
-    const MARGIN: f32 = 18.0;
-    const GAP: f32 = 10.0;
-
-    // ── 坐标系说明（这段是踩坑记录，改动前务必读完）────────────────────────
-    //
-    // 提醒弹窗是**独立的 OS 窗口**，不是主窗口里的控件，所以它的位置要走
-    // `ViewportBuilder::with_position` / `ViewportCommand::OuterPosition`
-    // （单位：egui points）。
-    //
-    // egui-winit 把 points 转成物理像素时，用的是**那个窗口自己的**
-    // `pixels_per_point = zoom_factor × window.scale_factor()`，而且每帧从
-    // `window.scale_factor()` 重新取（见 egui-winit 的 take_egui_input /
-    // update_viewport_info）。所以正确做法是「进/出用同一个系数」：
-    //   1. 工作区从 OS 拿到的是物理像素（GetMonitorInfoW.rcWork）；
-    //   2. 在弹窗回调里用**弹窗自己**的 pixels_per_point() 把工作区除成 points；
-    //   3. 布局在 points 里算完，交给 with_position / OuterPosition；
-    //   4. egui-winit 再乘回同一个系数 → 物理位置 = 我们想要的物理位置，恒等。
-    //
-    // 早期版本反过来：在物理像素里布局，乘一个 `GetDpiForSystem()` 猜出来的
-    // scale。远程桌面重连改了 DPI/分辨率后，这个 scale 和弹窗窗口真实的
-    // pixels_per_point 对不上，卡片宽度按错误系数折成物理像素，逐帧纠正左上角
-    // 也补不回右边距 —— 也就是用户看到的「弹窗跑到屏幕中间」。主窗口缓存的
-    // `ctx.pixels_per_point()` 同样可能是过期值，一律不用。
-    //
-    // 另：工作区取自主窗口所在的显示器（MonitorFromWindow），而不是
-    // SPI_GETWORKAREA 只给的主屏，多屏 / RDP 虚拟屏都能覆盖。
-
-    // 工作区：OS 给的物理像素（每帧现问，自动吸收 RDP 重连后的变化）。
-    let work_px = toast_work_area_px().unwrap_or_else(|| {
-        // 非 Windows 或取不到时的兜底：egui 0.37 的 monitor_size 是 egui points，
-        // 乘主窗口 ppp 折回物理像素，保持后面链路单位一致。
-        let ppp = ctx.pixels_per_point().max(0.5);
-        let size = ctx
-            .input(|i| i.viewport().monitor_size)
-            .unwrap_or(egui::vec2(1920.0, 1080.0));
-        egui::Rect::from_min_size(egui::Pos2::ZERO, size * ppp)
-    });
-    let mut actions: Vec<PopupAction> = Vec::new();
-    let mut measured: Vec<(Uuid, f32)> = Vec::new();
-    let total_popups = app.popups.len();
-
-    // 先把所有卡片的高度算出来（points），统一交给 `toast_layout_points()` 求位置。
-    // 顺序：`app.popups` 末尾那条在最下面，所以反着叠放。
-    let heights: Vec<f32> = (0..app.popups.len())
-        .rev()
-        .map(|idx| {
-            let popup = &app.popups[idx];
-            let has_note = !popup.note.trim().is_empty();
-            // 这里存的是「内容块」高度，与窗口尺寸无关，所以不会出现「测高→改窗口→再测高」的抖动。
-            let content_h = app
-                .popup_heights
-                .get(&popup.record_id)
-                .copied()
-                .unwrap_or_else(|| toast_estimate_content_h(has_note));
-            content_h + TOAST_PAD_TOP + TOAST_PAD_BOTTOM
-        })
-        .collect();
-
-    // 建窗用的种子位置：建窗那一刻还拿不到「弹窗自己的」pixels_per_point，
-    // 只能用主窗口的 ppp 估一个 points 值。首帧回调里会用弹窗真实 ppp 重算并
-    // 纠正（见下），所以这个估值即使过期也只会影响建窗那一瞬间。
-    let seed_ppp = ctx.pixels_per_point().max(0.5);
-    let boxes_seed = toast_layout_points(work_px / seed_ppp, CARD_W, MARGIN, GAP, &heights);
-
-    for (slot, idx) in (0..app.popups.len()).rev().enumerate() {
-        let popup = &app.popups[idx];
-        let h = heights[slot];
-        // 建窗种子位置（points）：首帧还没有弹窗自己的 ppp，只能用主窗口的估一个。
-        // 首帧回调里会用弹窗真实 ppp 重算并纠正，所以过期值只影响建窗那一瞬。
-        let seed_pos = boxes_seed[slot];
-
-        let viewport_id = egui::ViewportId::from_hash_of(("record-toast", popup.record_id));
-        let builder = egui::ViewportBuilder::default()
-            .with_title("")
-            .with_inner_size([CARD_W, h])
-            .with_position(seed_pos)
-            .with_resizable(false)
-            .with_decorations(false)
-            .with_always_on_top()
-            .with_window_level(egui::WindowLevel::AlwaysOnTop)
-            .with_taskbar(false)
-            .with_active(false);
-
-        ctx.show_viewport_immediate(viewport_id, builder, |vui, _| {
-            let vctx = vui.ctx().clone();
-            // 方案 A 的核心：用**弹窗这个窗口自己的** pixels_per_point 把
-            // 物理像素工作区折成 points，布局在 points 里算完，egui-winit 再用
-            // 同一个系数把 with_position / OuterPosition 乘回物理像素 —— 进/出
-            // 恒等，卡片必然落在正确物理位置，与系统 DPI、RDP 重连、主窗口
-            // 缓存是否过期都无关。首帧会借此把「种子位置」纠到正确值。
-            //
-            // 与 8b0797f 的 IME 修复一样，只在位置**确实偏了**时才发 OuterPosition：
-            // set_outer_position 每次都会 set_window_flags + InvalidateRgn，无条件
-            // 每帧调用会让置顶窗口持续「抖动」，干扰主窗口输入框正在进行的输入法
-            // 候选窗（用户反馈「提醒弹出时输入法无法显示候选内容」）。加阈值后，
-            // 稳定状态下不再每帧动窗口，输入法候选窗不再被打断。
-            let child_ppp = vctx.pixels_per_point().max(0.5);
-            let target =
-                toast_layout_points(work_px / child_ppp, CARD_W, MARGIN, GAP, &heights)[slot];
-            let needs_move = vctx
-                .input(|i| i.viewport().outer_rect)
-                .map(|r| (r.min - target).length() > 1.0)
-                .unwrap_or(true);
-            if needs_move {
-                vctx.send_viewport_cmd(ViewportCommand::OuterPosition(target));
-            }
-            egui::CentralPanel::default()
-                .frame(
-                    egui::Frame::NONE
-                        .fill(theme::TOAST_BG)
-                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(57, 66, 94)))
-                        .corner_radius(12)
-                        .inner_margin(egui::Margin {
-                            left: 16,
-                            right: 16,
-                            top: TOAST_PAD_TOP as i8,
-                            bottom: TOAST_PAD_BOTTOM as i8,
-                        }),
-                )
-                .show_inside(vui, |ui| {
-                    let body = ui.scope(|ui| {
-                        // 关掉默认 8px 行距，行高改由下面的 add_space 精确控制。
-                        ui.spacing_mut().item_spacing.y = 0.0;
-
-                        // ── 第 1 行：标签 + 标题（同一行）+ 关闭 ──
-                        // 标签用彩色圆点 + 彩色小字，标题紧随其后用白字，
-                        // 这样「标签 - 标题」一眼读完，不用分两行占高度。
-                        let tag = popup.tag.trim();
-                        let tag_color = if tag.is_empty() {
-                            Color32::from_rgb(150, 160, 184)
-                        } else {
-                            tag_color(tag)
-                        };
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            let (dot, _) =
-                                ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                            ui.painter().circle_filled(dot.center(), 3.5, tag_color);
-                            ui.label(
-                                RichText::new(if tag.is_empty() { "提醒" } else { tag })
-                                    .size(11.5)
-                                    .strong()
-                                    .color(tag_color),
-                            );
-                            // 标签和标题之间用一个弱化的小横杠分隔。
-                            ui.label(
-                                RichText::new("·")
-                                    .size(11.5)
-                                    .color(Color32::from_rgb(110, 122, 158)),
-                            );
-                            // 标题：不截断，长标题换行显示全。
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&popup.title)
-                                        .strong()
-                                        .size(15.0)
-                                        .color(Color32::WHITE),
-                                )
-                                .wrap(),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                // 单个关闭。
-                                if icon_button(ui, CloseIcon::Single, "关闭这一条") {
-                                    actions.push(PopupAction::Dismiss(popup.record_id));
-                                }
-                                // 批量关闭：只在有多个弹窗时出现，避免单条时误点。
-                                if total_popups > 1
-                                    && icon_button(
-                                        ui,
-                                        CloseIcon::All,
-                                        &format!("关闭全部 {total_popups} 条提醒"),
-                                    )
-                                {
-                                    actions.push(PopupAction::DismissAll);
-                                }
-                            });
-                        });
-
-                        // ── 第 2 行：计划日期时间 ──
-                        ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(format!(
-                                "📅 {}  周{}  {}",
-                                popup.date.format("%Y年%m月%d日"),
-                                weekday_cn(popup.date),
-                                model::fmt_time(popup.time)
-                            ))
-                            .size(11.5)
-                            .color(Color32::from_rgb(150, 165, 200)),
-                        );
-
-                        // ── 第 3 行：备注，完整换行显示，不截断 ──
-                        if !popup.note.trim().is_empty() {
-                            ui.add_space(5.0);
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&popup.note)
-                                        .size(12.0)
-                                        .color(Color32::from_rgb(190, 200, 220)),
-                                )
-                                .wrap(),
-                            );
-                        }
-
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            // 深色通知窗里的主操作：实心绿底 + 白字，浅绿底配白字几乎不可读。
-                            let done_btn = egui::Button::new(
-                                RichText::new("✓  完成").strong().color(Color32::WHITE),
-                            )
-                            .fill(theme::OK)
-                            .stroke(egui::Stroke::new(1.0_f32, theme::OK))
-                            .corner_radius(egui::CornerRadius::same(8))
-                            .min_size(egui::vec2(88.0, 32.0));
-                            if ui.add(done_btn).clicked() {
-                                actions.push(PopupAction::Complete(popup.record_id));
-                            }
-                            // 次要操作也做成实心按钮：浅一档的底色 + 亮描边 + 白字，
-                            // 在深色窗里既看得见又点得准（原来只是灰字，像说明文字）。
-                            let know_btn = egui::Button::new(
-                                RichText::new("知道了").strong().color(Color32::WHITE),
-                            )
-                            .fill(theme::TOAST_BTN)
-                            .stroke(egui::Stroke::new(1.0_f32, theme::TOAST_BTN_STROKE))
-                            .corner_radius(egui::CornerRadius::same(8))
-                            .min_size(egui::vec2(88.0, 32.0));
-                            if ui.add(know_btn).clicked() {
-                                actions.push(PopupAction::Dismiss(popup.record_id));
-                            }
-                        });
-                    });
-                    // 内容块实际占用高度：下一帧据此把窗口收到刚好包住内容 + 内边距。
-                    measured.push((popup.record_id, body.response.rect.height()));
-                });
-        });
-    }
-
-    app.popup_heights = measured.into_iter().collect();
-
-    for action in actions {
+    // 提醒卡片已迁移到原生 Win32 窗口（native_toast 模块）：
+    // - 列表推送在 logic() 里每秒一次（最小化时也照常工作）；
+    // - 这里只消费 toast 线程回传的点击动作。
+    for action in toast_take_actions() {
         match action {
-            PopupAction::Dismiss(id) => app.popups.retain(|p| p.record_id != id),
+            PopupAction::Dismiss(id) => {
+                app.popups.retain(|p| p.record_id != id);
+                app.save_and_sync("关闭提醒");
+            }
             PopupAction::Complete(id) => app.set_done(id, true),
             PopupAction::DismissAll => {
                 app.popups.clear();
                 app.popup_heights.clear();
+                app.save_and_sync("关闭全部提醒");
             }
         }
     }
-    ctx.request_repaint();
+    let _ = ctx;
 }
 
 

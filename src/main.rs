@@ -434,6 +434,22 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // toast 自测：--toast-test 弹一张假卡片，验证原生 toast 通路（不碰用户数据）。
+    if std::env::args().any(|a| a == "--toast-test") {
+        let card = ToastData {
+            record_id: uuid::Uuid::new_v4(),
+            tag: "普通事项".into(),
+            title: "原生 toast 自测卡片".into(),
+            date_line: "📅 2026年11月15日  周日  21:00".into(),
+            note: "这是一张测试卡片：验证独立 Win32 窗口渲染与按钮回传。".into(),
+        };
+        toast_push(vec![card.clone()]);
+        std::thread::sleep(Duration::from_secs(10));
+        toast_push(vec![]); // 10 秒后自动收走
+        std::thread::sleep(Duration::from_secs(1));
+        return Ok(());
+    }
+
     // panic 落盘：release 版 windows_subsystem=windows 没有控制台，panic 信息
     // 会被吞掉。而 `panic = "abort"`（profile.release）把它变成 0xc0000409
     // 快速失败，用户只看到进程消失。把消息+回写进 exe 旁的 panic.log，
@@ -1528,8 +1544,15 @@ mod native_toast {
     /// WM_TIMER：非阻塞轮询 rx；有 Sync 就 diff 建/销卡片窗；然后统一重定位。
     unsafe fn pump_sync(hwnd: HWND, state: &mut HostState) {
         let mut latest: Option<ToastCmd> = None;
+        let mut n = 0usize;
         while let Ok(cmd) = state.rx.try_recv() {
+            n += 1;
             latest = Some(cmd);
+        }
+        if n > 0 {
+            let _ = std::fs::OpenOptions::new().create(true).append(true)
+                .open("toast.log").and_then(|mut f| std::io::Write::write_all(&mut f,
+                    format!("pump got {n} cmds\n").as_bytes()));
         }
         if let Some(ToastCmd::CloseAll) = latest {
             destroy_all(hwnd);
@@ -1676,8 +1699,13 @@ mod native_toast {
         match msg {
             wm::WM_TIMER => {
                 if wparam == 1 {
-                    let state = wm::GetWindowLongPtrW(hwnd, 0 /*GWLP_USERDATA 不可用: 用 GWLP_USERDATA*/) as *mut HostState;
-                    // host 用 GWLP_USERDATA 存 state
+                    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        let _ = std::fs::OpenOptions::new().create(true).append(true)
+                            .open("toast.log").and_then(|mut f| std::io::Write::write_all(&mut f,
+                                b"wm_timer fired\n"));
+                    }
+                    let state = wm::GetWindowLongPtrW(hwnd, wm::GWLP_USERDATA) as *mut HostState;
                     if !state.is_null() {
                         pump_sync(hwnd, &mut *state);
                     }

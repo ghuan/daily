@@ -1378,10 +1378,111 @@ enum DialogKeep {
 }
 
 
+
+/// 演示数据：`--demo` 时用它替换真实 doc（覆盖界面各视图所需的全部数据），
+/// **只在内存里**，绝不写盘。用于生成 README 截图和人工检查样式。
+fn demo_doc() -> Option<Doc> {
+    if !std::env::args().any(|a| a == "--demo") {
+        return None;
+    }
+    let today = Local::now().date_naive();
+    let t = |h: u32, m: u32| NaiveTime::from_hms_opt(h, m, 0).unwrap_or_default();
+    let d = |n: i64| today + ChronoDuration::days(n);
+
+    // 模板：只用于「模板页」截图，不给日历铺记录（materialize 在 demo 下被禁用）
+    let mut weekly = RepeatRule::Weekly { weekdays: [false; 7] };
+    if let RepeatRule::Weekly { weekdays } = &mut weekly {
+        weekdays[4] = true;
+    }
+    let mut templates = vec![
+        Plan::new("晨跑 5 公里".into(), String::new(), t(7, 0)),
+        Plan::new("周报".into(), "每周五提交本周进展".into(), t(17, 0)),
+        Plan::new("房租".into(), "每月 5 号前转账".into(), t(9, 0)),
+    ];
+    templates[0].tag = "健康".into();
+    templates[0].repeat = RepeatRule::Daily;
+    templates[0].remind = RemindWindow {
+        advance_days: 0,
+        advance_minutes: 0,
+        grace_days: Some(0),
+        every_minutes: 60,
+    };
+    templates[1].tag = "工作".into();
+    templates[1].repeat = weekly;
+    templates[1].remind = RemindWindow {
+        advance_days: 1,
+        advance_minutes: 0,
+        grace_days: Some(1),
+        every_minutes: 60,
+    };
+    templates[2].tag = "固定支出".into();
+    templates[2].repeat = RepeatRule::Monthly { day: 5 };
+    templates[2].remind = RemindWindow {
+        advance_days: 3,
+        advance_minutes: 0,
+        grace_days: Some(2),
+        every_minutes: 60,
+    };
+
+    let mk = |date: NaiveDate, title: &str, tag: &str, note: &str, hour: u32, min: u32, done: bool| -> DayRecord {
+        let mut r = DayRecord {
+            id: Uuid::new_v4(),
+            template_id: None,
+            date,
+            title: title.to_string(),
+            tag: tag.to_string(),
+            note: note.to_string(),
+            time: NaiveTime::from_hms_opt(hour, min, 0).unwrap_or_default(),
+            remind: RemindWindow::default(),
+            done,
+            done_at: None,
+            cancelled: false,
+            customized: false,
+            last_fired: None,
+            snooze_until: None,
+            created_at: Local::now(),
+        };
+        if done {
+            r.done_at = Some(Local::now() - ChronoDuration::hours(2));
+        }
+        r
+    };
+
+    // 记录：分散在日历不同日子，内容各不相同（避免同一批标题刷满格子）
+    let records = vec![
+        mk(d(-6), "七里港源代码梳理", "普通事项", "10 月月会 PPT 后端招聘拟定", 9, 0, true),
+        mk(d(-3), "10 月月会 PPT", "月会ppt", "", 14, 0, true),
+        mk(d(-1), "后端面试", "工作", "候选人二面", 15, 0, true),
+        mk(today, "晨跑 5 公里", "健康", "", 7, 0, true),
+        mk(today, "牙医复诊", "健康", "带上上次的检查单", 14, 30, false),
+        mk(today, "喝水提醒", "每日计划", "", 10, 0, false),
+        mk(d(1), "产品评审", "工作", "准备演示材料", 15, 0, false),
+        mk(d(2), "新华医嘱独立服务开发", "工作", "接口联调 + 回归验证", 9, 0, false),
+        mk(d(3), "周报", "工作", "每周五提交本周进展", 17, 0, false),
+        mk(d(5), "房租", "固定支出", "每月 5 号前转账", 9, 0, false),
+        mk(d(8), "年度体检", "健康", "早上空腹", 8, 0, false),
+        mk(d(12), "宁波中慢病渗透测试整改", "普通事项", "七层 weekly 后端漏洞验证", 10, 0, false),
+    ];
+
+    let mut doc = Doc::default();
+    doc.templates = templates;
+    doc.records = records;
+    doc.tags = vec![
+        "健康".into(),
+        "工作".into(),
+        "每日计划".into(),
+        "固定支出".into(),
+        "普通事项".into(),
+        "月会ppt".into(),
+    ];
+    Some(doc)
+}
+
 /// 演示用弹窗数据：**仅当进程带 `--demo` 参数时**才注入，不会写任何文件，
 /// 也不影响真实提醒数据。用于人工检查卡片样式与按钮 hover。
 fn demo_popups() -> Vec<Popup> {
-    if !std::env::args().any(|a| a == "--demo") {
+    // 只有显式 --demo-popups 才弹演示卡片：截主界面时不该有弹窗遮挡。
+    if !std::env::args().any(|a| a == "--demo-popups") {
         return Vec::new();
     }
     let today = Local::now().date_naive();
@@ -1507,10 +1608,16 @@ impl PlanApp {
         remember_main_hwnd(cc);
 
         let dir = store::app_dir();
-        let settings = store::read_json::<Settings>(&dir.join(store::SETTINGS_FILE))
+        // --demo：强制本地存储，避免启动拉取把演示数据覆盖成真实数据。
+        let demo_mode = std::env::args().any(|a| a == "--demo");
+        let mut settings = store::read_json::<Settings>(&dir.join(store::SETTINGS_FILE))
             .ok()
             .flatten()
             .unwrap_or_default();
+        if demo_mode {
+            settings.kind = Kind::Local;
+            settings.autostart = false;
+        }
 
         // 读本地数据。**不在这里做网络拉取**：`git.pull()` 是 clone/fetch，要几百毫秒
         // 到几十秒；放在构造期会让窗口已出现但内容迟迟画不出来（用户看到的就是白窗）。
@@ -1536,10 +1643,14 @@ impl PlanApp {
                 eprintln!("[bell] 已把 Git 同步路径从 plans.json 升级为 plans/");
             }
         }
-        let doc = backend.load().unwrap_or_else(|e| {
-            eprintln!("[bell] 读取计划失败：{e}");
-            Doc::default()
-        });
+        // --demo：用内存里的演示数据替换真实 doc（不读盘、不写盘）
+        let doc = match demo_doc() {
+            Some(d) => d,
+            None => backend.load().unwrap_or_else(|e| {
+                eprintln!("[bell] 读取计划失败：{e}");
+                Doc::default()
+            }),
+        };
 
         let autolaunch = auto_launch::AutoLaunchBuilder::new()
             .set_app_name("bell-reminder")
@@ -1596,9 +1707,36 @@ impl PlanApp {
             cfg_git: settings.git.clone(),
             settings,
             doc,
-            page: WorkspacePage::Calendar,
+            // --demo-page=stats|templates 可指定初始页（截图用）
+            page: {
+                let mut p = WorkspacePage::Calendar;
+                for a in std::env::args() {
+                    if let Some(v) = a.strip_prefix("--demo-page=") {
+                        p = match v {
+                            "stats" => WorkspacePage::Stats,
+                            "templates" => WorkspacePage::Templates,
+                            _ => WorkspacePage::Calendar,
+                        };
+                    }
+                }
+                p
+            },
             selected_date: Local::now().date_naive(),
-            date_view: DateView::Calendar,
+            // --demo-view=day|week|month|calendar 指定初始日期视图（截图用）
+            date_view: {
+                let mut v = DateView::Calendar;
+                for a in std::env::args() {
+                    if let Some(x) = a.strip_prefix("--demo-view=") {
+                        v = match x {
+                            "day" => DateView::Day,
+                            "week" => DateView::Week,
+                            "month" => DateView::Month,
+                            _ => DateView::Calendar,
+                        };
+                    }
+                }
+                v
+            },
             view_record: None,
             edit: None,
             delete_prompt: None,
@@ -1660,6 +1798,10 @@ impl PlanApp {
     /// 所有增删改都走这里：本地落盘永远是立即的、同步完成的；网络推送则攒
     /// `PUSH_DELAY`（5 分钟）再做 —— 停手之后才联网，连续编辑只推最后一次。
     fn save_and_sync(&mut self, reason: &str) {
+        // --demo：演示数据只在内存里，绝不落盘。
+        if std::env::args().any(|a| a == "--demo") {
+            return;
+        }
         if let Err(e) = self.persist() {
             self.set_status(format!("保存失败：{e}"), false);
             return;
@@ -2027,6 +2169,11 @@ impl PlanApp {
     /// 让模板覆盖指定日期范围。已存在（包括被删除的墓碑）与用户定制过的记录都不会被覆盖。
     /// `persist=true` 在用户切换日期视图时落盘；后台预生成只改内存。
     fn materialize_range(&mut self, start: NaiveDate, end: NaiveDate, reason: &str, persist: bool) {
+        // --demo：演示数据要「稀疏好看」，不做模板自动铺入（否则日历被同一批
+        // 模板刷满）。真实运行不受影响。
+        if std::env::args().any(|a| a == "--demo") {
+            return;
+        }
         let mut created = Vec::new();
         for template in &self.doc.templates {
             if !template.enabled {
@@ -2121,6 +2268,7 @@ impl PlanApp {
         let now = Local::now();
         let today = now.date_naive();
         // 今天及之后 90 天预先生成，打开任意日期时都能看到稳定记录。
+        // （--demo 时 materialize_range 内部会直接返回）
         self.materialize_range(
             today,
             today + ChronoDuration::days(90),

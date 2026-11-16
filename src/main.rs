@@ -1577,6 +1577,9 @@ struct PlanApp {
     /// 已绘制帧数（首帧创建托盘会拖慢绘制，见 ui() 注释）。
     frames_drawn: u32,
     status: Option<(String, bool, Instant)>,
+    /// 手动「提醒一次」的临时反馈：没有可弹记录时，按钮上短暂显示提示。
+    /// 不写 status 行（那一行只留给存储位置与同步结果）。
+    fire_hint_until: Option<Instant>,
     syncing: bool,
     /// 有道云笔记式的**延迟推送队列**：增删改只入队，攒 5 分钟再真正 push
     ///（见 `PushQueueEntry`）。`None` = 队列里没有待推送的消息。
@@ -1799,6 +1802,7 @@ impl PlanApp {
             conflict_error: None,
             frames_drawn: 0,
             status: None,
+            fire_hint_until: None,
             syncing: startup_pull,
             push_queue: None,
             sync_tx,
@@ -2187,11 +2191,13 @@ impl PlanApp {
         let added = picked.len();
         self.popups.extend(picked);
 
+        // 不往状态行写任何提示：状态行只留给存储位置与同步结果（用户要求）。
+        // 没有可弹记录时，让按钮自己短暂显示「无提醒」，给个明确反馈。
         if added == 0 {
-            self.set_status("当前没有处于提醒窗口内的记录".to_string(), false);
+            self.fire_hint_until = Some(Instant::now() + Duration::from_secs(2));
+            ctx.request_repaint();
             return;
         }
-        self.set_status(format!("已手动触发 {added} 条提醒"), true);
         if self.settings.sound {
             notify::play();
         }
@@ -3955,8 +3961,12 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                     // 手动提醒一次：弹出当前处于提醒窗口内的记录。
                     // 不影响定时节奏（不改 last_fired），已在弹窗中的会跳过。
                     // 与「＋ 今日记录」同尺寸同圆角，仅颜色不同（暖色，区分主操作）。
+                    let firing_hint = app
+                        .fire_hint_until
+                        .is_some_and(|t| Instant::now() < t);
+                    let label = if firing_hint { "无提醒" } else { "提醒一次" };
                     if ui
-                        .add(button_filled("提醒一次", theme::WARN))
+                        .add(button_filled(label, theme::WARN))
                         .on_hover_text("立即弹出当前处于提醒窗口内的记录（不影响定时）")
                         .clicked()
                     {
@@ -6897,6 +6907,7 @@ mod workflow_tests {
             conflict_error: None,
             frames_drawn: 0,
             status: None,
+            fire_hint_until: None,
             syncing: false,
             push_queue: None,
             sync_tx,

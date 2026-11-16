@@ -2823,26 +2823,15 @@ fn button_mini(text: &str) -> egui::Button<'static> {
 ///
 /// 用 painter 自绘而不是渲染 `✕` 字符：深色底上线条颜色可控，
 /// 也不怕字体缺字显示成方框。
-fn icon_button(ui: &mut egui::Ui, icon: CloseIcon, tip: &str) -> bool {
-    let size = egui::vec2(26.0, 26.0);
-    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
-    let color = if resp.hovered() {
-        Color32::WHITE
-    } else {
-        Color32::from_rgb(150, 160, 184)
-    };
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
+/// 关闭图标区域的预留宽度（两个图标 + 间距），标题换行时要用它避让。
+const CLOSE_AREA: f32 = 56.0;
+
+/// 在给定矩形里画一个关闭图标（不含交互），供绝对定位版复用。
+fn draw_close_icon(ui: &egui::Ui, rect: egui::Rect, icon: CloseIcon, color: Color32) {
     let painter = ui.painter();
     let c = rect.center();
-    // 外圈：悬停时填充淡底，常态只有描边。
     let ring_r = 8.5;
-    if resp.hovered() {
-        painter.circle_filled(c, ring_r + 1.5, Color32::from_rgb(56, 66, 98));
-    }
     painter.circle_stroke(c, ring_r, egui::Stroke::new(1.4_f32, color));
-    // 圈内的 ×：略小于圈半径，留出呼吸空间。
     let r = 3.8;
     let stroke = egui::Stroke::new(1.5_f32, color);
     match icon {
@@ -2851,7 +2840,6 @@ fn icon_button(ui: &mut egui::Ui, icon: CloseIcon, tip: &str) -> bool {
             painter.line_segment([c + egui::vec2(r, -r), c + egui::vec2(-r, r)], stroke);
         }
         CloseIcon::All => {
-            // 「全部」：圈内画两个并排的小 ×。
             let rr = 2.6;
             for dx in [-3.0_f32, 3.0] {
                 let cc = c + egui::vec2(dx, 0.0);
@@ -2860,8 +2848,8 @@ fn icon_button(ui: &mut egui::Ui, icon: CloseIcon, tip: &str) -> bool {
             }
         }
     }
-    resp.on_hover_text(tip).clicked()
 }
+
 
 /// 关闭图标的两种形态。
 #[derive(Clone, Copy)]
@@ -7943,33 +7931,77 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                                     .color(Color32::from_rgb(110, 122, 158)),
                             );
                             // 标题：不截断，长标题换行显示全。
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&popup.title)
-                                        .strong()
-                                        .size(15.0)
-                                        .color(Color32::WHITE),
-                                )
-                                .wrap(),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                                ui.spacing_mut().item_spacing.x = 2.0;
-                                // 单个关闭。
-                                if icon_button(ui, CloseIcon::Single, "关闭这一条") {
-                                    actions.push(PopupAction::Dismiss(popup.record_id));
-                                }
-                                // 批量关闭：只在有多个弹窗时出现，避免单条时误点。
-                                if total_popups > 1
-                                    && icon_button(
-                                        ui,
-                                        CloseIcon::All,
-                                        &format!("关闭全部 {total_popups} 条提醒"),
+                            // 用 `add_sized` 限制最大宽度（右侧预留 CLOSE_AREA 给
+                            // 两个绝对定位的关闭图标），这样标题仍在标签右侧、
+                            // 同一行起始，换行后也不会压到关闭按钮。
+                            let title_w = (ui.available_width() - CLOSE_AREA).max(60.0);
+                            // 用 wrap + ui.scope 限定最大宽度，让标题自然左对齐换行。
+                            // （add_sized 会把 Label 撑满固定宽度并居中，视觉上标题
+                            //   就跑到行中间去了 —— 实测踩过两次，别再用。）
+                            ui.scope(|ui| {
+                                ui.set_max_width(title_w);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&popup.title)
+                                            .strong()
+                                            .size(15.0)
+                                            .color(Color32::WHITE),
                                     )
-                                {
-                                    actions.push(PopupAction::DismissAll);
-                                }
+                                    .wrap(),
+                                );
                             });
                         });
+
+                        // ── 右上角关闭按钮（绝对定位，不占标题行空间）──
+                        // 用卡片自身矩形定位，保证无论标题换几行都固定在同一位置，
+                        // 且永远画在标题文字**之上**（后画 = 更靠前）。
+                        {
+                            let card_rect = ui.max_rect();
+                            let icon_r = 11.0_f32;
+                            let gap_x = 2.0_f32;
+                            let cy = card_rect.top() + 4.0 + icon_r;
+                            let cx_all = card_rect.right() - 4.0 - icon_r;
+                            let cx_single = cx_all - gap_x - icon_r * 2.0;
+                            let mut buttons: Vec<(f32, CloseIcon, String)> = vec![(
+                                cx_single,
+                                CloseIcon::Single,
+                                "关闭这一条".to_string(),
+                            )];
+                            if total_popups > 1 {
+                                buttons.push((
+                                    cx_all,
+                                    CloseIcon::All,
+                                    format!("关闭全部 {total_popups} 条提醒"),
+                                ));
+                            }
+                            for (cx, icon, tip) in buttons {
+                                let rect = egui::Rect::from_center_size(
+                                    egui::pos2(cx, cy),
+                                    egui::vec2(icon_r * 2.0, icon_r * 2.0),
+                                );
+                                let resp = ui
+                                    .interact(
+                                        rect,
+                                        ui.id().with(("toast-close", popup.record_id, tip.clone())),
+                                        egui::Sense::click(),
+                                    )
+                                    .on_hover_text(tip.clone());
+                                let col = if resp.hovered() {
+                                    Color32::from_rgb(220, 228, 245)
+                                } else {
+                                    Color32::from_rgb(140, 152, 180)
+                                };
+                                draw_close_icon(ui, rect, icon, col);
+                                if resp.clicked() {
+                                    match icon {
+                                        CloseIcon::Single => {
+                                            actions.push(PopupAction::Dismiss(popup.record_id))
+                                        }
+                                        CloseIcon::All => actions.push(PopupAction::DismissAll),
+                                    }
+                                }
+                            }
+                        }
 
                         // ── 第 2 行：计划日期时间 ──
                         ui.add_space(4.0);

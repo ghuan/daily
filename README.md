@@ -182,7 +182,10 @@ assets/     图标、提示音、资源脚本、asInvoker 清单
 改这些地方之前请先读——都是「看着可以简化、实际会坏」的：
 
 - **隐藏到托盘用「分层透明」而非 `SW_HIDE`**：`SW_HIDE` 后 winit 不再派发重绘事件，事件循环停摆，表现为「托盘点了没反应、到点也不弹提醒」。程序用 `WS_EX_LAYERED`（全透明）+ `WS_EX_TOOLWINDOW`（移出任务栏）
-- **最小化被拦截为「收进托盘」**：真最小化会把客户区压成 0×0，而 WGL 的 surface 不支持 resize，在 0×0 上交换缓冲会崩（Intel 核显实测多次）。子类化窗口拦截 `SC_MINIMIZE`，转走隐藏流程
+- **最小化被拦截为「收进托盘」**：真最小化会把客户区压成 0×0（实测 `client=0x0`），而 WGL 的 surface 不支持 resize，在 0×0 上 swap_buffers 会崩（Intel 核显实测多次）。子类化窗口拦截 `SC_MINIMIZE`，转走隐藏流程。
+  - 为什么不能改配置绕开：eframe 的 `App` trait 没有任何钩子能干预「是否画这一帧」，决定权在 `glow_integration.rs` 的 `if is_visible { ... }` 内部；`NativeOptions` 也只有 `multisampling` / `depth_buffer` / `renderer` 三个相关项。
+  - 为什么换成 wgpu 也不行：wgpu 默认走 Vulkan，而本机 Intel Vulkan 驱动（`igvk64.dll` 27.20.100.8783）在初始化阶段直接 AV；强制 DX12 能起来，但最小化/恢复时 surface 重建会让整个程序卡死。
+  - 为什么 deferred viewport 也不行：eframe 的渲染判定是 `show_ui = 主窗口可见 || 任意子 viewport 可见`，只要提醒卡片可见，最小化的主窗口照样会被拉去渲染。
 - **提醒卡片是独立 OS 窗口**，定位必须用**弹窗自己的** `pixels_per_point` 换算（物理像素 → points → egui-winit 再乘回同一系数）。用主窗口缓存的值在 RDP 重连后会漂到屏幕中间
 - **提醒调度跑在 `logic()` 而不是 `ui()`**：窗口最小化时 `ui()` 根本不执行，且 eframe 只在「有 repaint 请求」时才补跑。另有后台线程每秒 `request_repaint` 维持心跳
 - **托盘退出必须显式 `NIM_DELETE`**：`process::exit()` 不跑析构，`TrayIcon::drop()` 里的删除不会执行，图标会残留到鼠标划过才消失

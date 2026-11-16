@@ -2893,6 +2893,20 @@ fn button_filled(text: &str, fill: Color32) -> egui::Button<'static> {
     .min_size(egui::vec2(0.0, 34.0))
 }
 
+/// 白底按钮：与「今日记录」同尺寸同圆角，白底深字。
+/// 用于「立即同步 / 管理模板 / 设置」这些次要但需要明确可点的操作。
+fn button_white(text: &str) -> egui::Button<'static> {
+    egui::Button::new(
+        RichText::new(text.to_owned())
+            .strong()
+            .color(theme::TEXT),
+    )
+    .fill(Color32::WHITE)
+    .stroke(egui::Stroke::new(1.0, theme::BORDER))
+    .corner_radius(egui::CornerRadius::same(9))
+    .min_size(egui::vec2(0.0, 34.0))
+}
+
 /// 次要按钮（透明底）。
 fn button_ghost(text: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_owned()).color(theme::TEXT_WEAK))
@@ -3947,38 +3961,43 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                             .color(theme::TEXT_WEAK),
                     );
                 });
+                // right_to_left 布局：代码从上到下 = 屏幕从右到左。
+                // 目标显示顺序（左→右）：提醒一次、今日记录、立即同步、管理模板、设置。
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.add(button_ghost("设置")).clicked() {
+                    // —— 最右：设置 ——
+                    if ui.add(button_white("设置")).clicked() {
                         open_settings(app);
                     }
-                    ui.add_space(4.0);
-                    // 手动同步：立即执行一轮「pull + push」，并清掉延迟队列。
-                    // 仅 Git 模式显示 —— 本地模式没有远端，「立即同步」无意义。
+                    ui.add_space(6.0);
+
+                    // —— 管理模板 ——
+                    if ui.add(button_white("管理模板")).clicked() {
+                        app.page = WorkspacePage::Templates;
+                    }
+                    ui.add_space(6.0);
+
+                    // —— 立即同步（仅 Git 模式）——
                     if app.settings.kind == Kind::Git {
                         if ui
                             .add_enabled(
                                 !app.syncing,
-                                button_ghost(if app.syncing { "同步中…" } else { "立即同步" }),
+                                button_white(if app.syncing { "同步中…" } else { "立即同步" }),
                             )
                             .clicked()
                         {
                             app.push_queue = None;
                             app.manual_sync();
                         }
-                        ui.add_space(4.0);
+                        ui.add_space(6.0);
                     }
-                    // 「今日记录」：始终针对今天，不跟随上面选中的日期。
+
+                    // —— 今日记录 ——
                     if ui.add(button_primary("＋  今日记录")).clicked() {
                         app.open_edit_state(EditState::new_record(Local::now().date_naive()));
                     }
-                    ui.add_space(4.0);
-                    if ui.add(button_ghost("管理模板")).clicked() {
-                        app.page = WorkspacePage::Templates;
-                    }
-                    ui.add_space(4.0);
-                    // 手动提醒一次：弹出当前处于提醒窗口内的记录。
-                    // 不影响定时节奏（不改 last_fired），已在弹窗中的会跳过。
-                    // 与「＋ 今日记录」同尺寸同圆角，仅颜色不同（暖色，区分主操作）。
+                    ui.add_space(6.0);
+
+                    // —— 最左：提醒一次 ——
                     let firing_hint = app
                         .fire_hint_until
                         .is_some_and(|t| Instant::now() < t);

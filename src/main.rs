@@ -2107,7 +2107,7 @@ impl PlanApp {
         }
         let menu = Menu::new();
         let open = MenuItem::with_id(MENU_OPEN, "打开主界面", true, None);
-        let fire = MenuItem::with_id(MENU_FIRE, "触发提醒", true, None);
+        let fire = MenuItem::with_id(MENU_FIRE, "提醒一次", true, None);
         let autostart = CheckMenuItem::with_id(
             MENU_AUTOSTART,
             "开机自启",
@@ -2851,6 +2851,19 @@ fn button_primary(text: &str) -> egui::Button<'static> {
             .color(Color32::WHITE),
     )
     .fill(theme::ACCENT)
+    .stroke(egui::Stroke::NONE)
+    .corner_radius(egui::CornerRadius::same(9))
+    .min_size(egui::vec2(0.0, 34.0))
+}
+
+/// 实心按钮，但用自定义底色（与 `button_primary` 同尺寸/圆角，仅颜色不同）。
+fn button_filled(text: &str, fill: Color32) -> egui::Button<'static> {
+    egui::Button::new(
+        RichText::new(text.to_owned())
+            .strong()
+            .color(Color32::WHITE),
+    )
+    .fill(fill)
     .stroke(egui::Stroke::NONE)
     .corner_radius(egui::CornerRadius::same(9))
     .min_size(egui::vec2(0.0, 34.0))
@@ -3939,10 +3952,11 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                         app.page = WorkspacePage::Templates;
                     }
                     ui.add_space(4.0);
-                    // 手动触发提醒：弹出当前处于提醒窗口内的记录。
+                    // 手动提醒一次：弹出当前处于提醒窗口内的记录。
                     // 不影响定时节奏（不改 last_fired），已在弹窗中的会跳过。
+                    // 与「＋ 今日记录」同尺寸同圆角，仅颜色不同（暖色，区分主操作）。
                     if ui
-                        .add(button_ghost("触发提醒"))
+                        .add(button_filled("提醒一次", theme::WARN))
                         .on_hover_text("立即弹出当前处于提醒窗口内的记录（不影响定时）")
                         .clicked()
                     {

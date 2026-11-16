@@ -8012,13 +8012,13 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                             let icon_r = 11.0_f32;
                             let gap_x = 2.0_f32;
                             let cy = card_rect.top() + 4.0 + icon_r;
-                            let cx_all = card_rect.right() - 4.0 - icon_r;
-                            let cx_single = cx_all - gap_x - icon_r * 2.0;
-                            let mut buttons: Vec<(f32, CloseIcon, String)> = vec![(
-                                cx_single,
-                                CloseIcon::Single,
-                                "关闭这一条".to_string(),
-                            )];
+                            // 位置约定（与原 right_to_left 布局一致）：
+                            // **最右边 = 单条关闭**，它左边 = 全部关闭。
+                            let cx_single = card_rect.right() - 4.0 - icon_r;
+                            let cx_all = cx_single - gap_x - icon_r * 2.0;
+                            let mut buttons: Vec<(f32, CloseIcon, String)> = vec![
+                                (cx_single, CloseIcon::Single, "关闭这一条".to_string()),
+                            ];
                             if total_popups > 1 {
                                 buttons.push((
                                     cx_all,

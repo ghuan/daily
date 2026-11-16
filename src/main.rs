@@ -1377,6 +1377,42 @@ enum DialogKeep {
     Conflicts,
 }
 
+
+/// 演示用弹窗数据：**仅当进程带 `--demo` 参数时**才注入，不会写任何文件，
+/// 也不影响真实提醒数据。用于人工检查卡片样式与按钮 hover。
+fn demo_popups() -> Vec<Popup> {
+    if !std::env::args().any(|a| a == "--demo") {
+        return Vec::new();
+    }
+    let today = Local::now().date_naive();
+    vec![
+        Popup {
+            record_id: Uuid::new_v4(),
+            tag: "普通事项".into(),
+            title: "宁波中慢病渗透测试整改".into(),
+            note: "七层-weekly-1 后端漏洞验证".into(),
+            date: today,
+            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
+        },
+        Popup {
+            record_id: Uuid::new_v4(),
+            tag: "工作".into(),
+            title: "新华医嘱独立服务开发".into(),
+            note: "接口联调 + 回归验证".into(),
+            date: today + ChronoDuration::days(1),
+            time: NaiveTime::from_hms_opt(10, 30, 0).unwrap_or_default(),
+        },
+        Popup {
+            record_id: Uuid::new_v4(),
+            tag: "生日".into(),
+            title: "一条标题比较长的提醒，用来验证标题换行时卡片高度是否自适应".into(),
+            note: String::new(),
+            date: today + ChronoDuration::days(3),
+            time: NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default(),
+        },
+    ]
+}
+
 struct PlanApp {
     settings: Settings,
     doc: Doc,
@@ -1574,7 +1610,7 @@ impl PlanApp {
             show_settings: false,
             cfg_error: None,
             cfg_msg: None,
-            popups: Vec::new(),
+            popups: demo_popups(),
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),
             last_conflict_scan: Instant::now() - Duration::from_secs(60), // 启动后尽检
@@ -2094,16 +2130,22 @@ impl PlanApp {
 
         // 提前提醒的弹窗在「记录日 - N 天」就会出现，所以按各自的提醒窗口判断，
         // 而不是简单地要求「记录日期等于今天」。
-        let stale: Vec<Uuid> = self
-            .popups
-            .iter()
-            .filter(|p| {
-                self.doc
-                    .record(p.record_id)
-                    .is_none_or(|r| !r.in_reminder_window(&now))
-            })
-            .map(|p| p.record_id)
-            .collect();
+        // --demo 模式下跳过清理：演示卡片不对应 doc 里的真实记录，
+        // 否则会被 is_none_or 判为「记录已不存在」立刻删掉。
+        let demo_mode = std::env::args().any(|a| a == "--demo");
+        let stale: Vec<Uuid> = if demo_mode {
+            Vec::new()
+        } else {
+            self.popups
+                .iter()
+                .filter(|p| {
+                    self.doc
+                        .record(p.record_id)
+                        .is_none_or(|r| !r.in_reminder_window(&now))
+                })
+                .map(|p| p.record_id)
+                .collect()
+        };
         if !stale.is_empty() {
             self.popups.retain(|p| !stale.contains(&p.record_id));
         }
@@ -7736,60 +7778,60 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                             // 悬停反馈：egui 的 Button::fill 是固定色，不会随交互变化，
                             // 所以先按常态画一遍拿到响应，hovered 时用提亮色重绘一次
                             // （同一帧内覆盖，用户看不到中间态）。
-                            let done_resp = ui.add(
-                                egui::Button::new(
-                                    RichText::new("✓  完成").strong().color(Color32::WHITE),
-                                )
-                                .fill(theme::OK)
-                                .stroke(egui::Stroke::new(1.0_f32, theme::OK))
-                                .corner_radius(egui::CornerRadius::same(8))
-                                .min_size(egui::vec2(88.0, 32.0)),
-                            );
-                            let done_rect = done_resp.rect;
-                            if done_resp.hovered() {
-                                ui.painter().rect_filled(
-                                    done_rect,
-                                    egui::CornerRadius::same(8),
-                                    theme::OK_HOVER,
-                                );
-                                ui.painter().text(
-                                    done_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "✓  完成",
-                                    egui::FontId::proportional(13.0),
-                                    Color32::WHITE,
-                                );
-                            }
+                            // hover 反馈的正确做法：不改 Button::fill（那是固定色），
+                            // 而是给这个作用域设置 visuals 的 weak_bg_fill。
+                            // egui 的 Button 在不指定 fill 时用 visuals.weak_bg_fill，
+                            // 并按 interact 状态自动挑 inactive / hovered / active 三档。
+                            // 这样底色随悬停变化，而文字仍由 Button 自己绘制（字体不变）。
+                            let done_resp = ui
+                                .scope(|ui| {
+                                    let w = &mut ui.visuals_mut().widgets;
+                                    w.inactive.weak_bg_fill = theme::OK;
+                                    w.hovered.weak_bg_fill = theme::OK_HOVER;
+                                    w.active.weak_bg_fill = theme::OK_HOVER;
+                                    w.inactive.bg_stroke = egui::Stroke::new(1.0_f32, theme::OK);
+                                    w.hovered.bg_stroke = egui::Stroke::new(1.0_f32, theme::OK_HOVER);
+                                    w.active.bg_stroke = egui::Stroke::new(1.0_f32, theme::OK_HOVER);
+                                    ui.add(
+                                        egui::Button::new(
+                                            RichText::new("✓  完成")
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        )
+                                        .corner_radius(egui::CornerRadius::same(8))
+                                        .min_size(egui::vec2(88.0, 32.0)),
+                                    )
+                                })
+                                .inner;
                             if done_resp.clicked() {
                                 actions.push(PopupAction::Complete(popup.record_id));
                             }
 
                             ui.add_space(8.0);
 
-                            let know_resp = ui.add(
-                                egui::Button::new(
-                                    RichText::new("知道了").strong().color(Color32::WHITE),
-                                )
-                                .fill(theme::TOAST_BTN)
-                                .stroke(egui::Stroke::new(1.0_f32, theme::TOAST_BTN_STROKE))
-                                .corner_radius(egui::CornerRadius::same(8))
-                                .min_size(egui::vec2(88.0, 32.0)),
-                            );
-                            let know_rect = know_resp.rect;
-                            if know_resp.hovered() {
-                                ui.painter().rect_filled(
-                                    know_rect,
-                                    egui::CornerRadius::same(8),
-                                    theme::TOAST_BTN_HOVER,
-                                );
-                                ui.painter().text(
-                                    know_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "知道了",
-                                    egui::FontId::proportional(13.0),
-                                    Color32::WHITE,
-                                );
-                            }
+                            let know_resp = ui
+                                .scope(|ui| {
+                                    let w = &mut ui.visuals_mut().widgets;
+                                    w.inactive.weak_bg_fill = theme::TOAST_BTN;
+                                    w.hovered.weak_bg_fill = theme::TOAST_BTN_HOVER;
+                                    w.active.weak_bg_fill = theme::TOAST_BTN_HOVER;
+                                    w.inactive.bg_stroke =
+                                        egui::Stroke::new(1.0_f32, theme::TOAST_BTN_STROKE);
+                                    w.hovered.bg_stroke =
+                                        egui::Stroke::new(1.0_f32, theme::TOAST_BTN_HOVER);
+                                    w.active.bg_stroke =
+                                        egui::Stroke::new(1.0_f32, theme::TOAST_BTN_HOVER);
+                                    ui.add(
+                                        egui::Button::new(
+                                            RichText::new("知道了")
+                                                .strong()
+                                                .color(Color32::WHITE),
+                                        )
+                                        .corner_radius(egui::CornerRadius::same(8))
+                                        .min_size(egui::vec2(88.0, 32.0)),
+                                    )
+                                })
+                                .inner;
                             if know_resp.clicked() {
                                 actions.push(PopupAction::Dismiss(popup.record_id));
                             }

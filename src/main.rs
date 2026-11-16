@@ -6493,6 +6493,44 @@ mod workflow_tests {
 
     /// 弹窗定位：必须落在工作区**右下角**（全部按 points 计算）。
     #[test]
+
+    /// 弹窗高度估算：长标题/长备注必须估出更多行，否则首帧会把内容压重叠。
+    #[test]
+    fn toast_estimate_grows_with_wrapping() {
+        // 短标题无备注
+        let short = toast_estimate_content_h("买菜", "");
+        // 长标题（会换行）
+        let long_title = toast_estimate_content_h(
+            "一条标题比较长的提醒，用来验证标题换行时卡片高度是否自适应足够",
+            "",
+        );
+        assert!(
+            long_title > short,
+            "长标题应估得更高: long={long_title} short={short}"
+        );
+
+        // 带备注的更高
+        let with_note = toast_estimate_content_h("买菜", "记得买西红柿和鸡蛋");
+        assert!(
+            with_note > short,
+            "有备注应估得更高: note={with_note} short={short}"
+        );
+
+        // 多行备注 > 单行备注
+        let one_line = toast_estimate_content_h("买菜", "买西红柿");
+        let many_lines = toast_estimate_content_h(
+            "买菜",
+            "买西红柿和鸡蛋，顺便看一下牛奶还有没有，没有的话买两盒回来，另外记得问一下物业电梯维修的事",
+        );
+        assert!(
+            many_lines > one_line,
+            "多行备注应估得更高: many={many_lines} one={one_line}"
+        );
+
+        // 空内容也要有正值（避免 0 高度窗口）
+        assert!(toast_estimate_content_h("", "") > 50.0);
+    }
+
     fn toast_layout_sticks_to_bottom_right() {
         const CARD_W: f32 = 420.0;
         const MARGIN: f32 = 18.0;
@@ -7603,15 +7641,50 @@ fn tag_badge_light(ui: &mut egui::Ui, tag: &str) {
         });
 }
 
-/// 首帧还没量到内容高度时的估算值（无备注 / 有备注）。
+/// 首帧还没量到真实内容高度时的估算值（points）。
 ///
-/// 现在固定有「标签·标题」行 + 日期时间行 + 按钮行，备注会换行，所以估值比原来高。
-fn toast_estimate_content_h(has_note: bool) -> f32 {
-    if has_note {
-        132.0
+/// 按「逐行累加」估，而不是固定 106/132：
+/// - 标题会换行（长标题每行约 15pt 高）；
+/// - 备注也会换行（每行约 18pt 高）；
+/// - 日期行、按钮行、行间距都是固定值。
+///
+/// 估小了会导致首帧卡片被压扁、标题/备注和相邻行重叠（实测踩过：
+/// 长标题换行后第二行压在日期行上）。宁可略微估大一点，让首帧就有
+/// 足够空间，第二帧再用 `measured` 精确回收。
+fn toast_estimate_content_h(title: &str, note: &str) -> f32 {
+    // 卡片内容区宽度（420 - 左右内边距 16*2 - 滚动条余量）≈ 378pt
+    const INNER_W: f32 = 372.0;
+    // 标题字号 15pt，中文字宽约等于字号；预留右侧两个关闭图标约 60pt
+    let title_per_line = ((INNER_W - 60.0) / 15.0).max(6.0);
+    let title_lines = wrapped_lines(title, title_per_line);
+    // 备注字号 12pt
+    let note_per_line = (INNER_W / 12.0).max(8.0);
+    let note_lines = if note.trim().is_empty() {
+        0.0
     } else {
-        106.0
+        wrapped_lines(note, note_per_line) as f32
+    };
+
+    // 各行高度（与 ui_popups 里的 add_space / 字号对应）
+    let line1 = 22.0 + (title_lines as f32 - 1.0).max(0.0) * 19.0; // 标签+标题行（含换行增量）
+    let gap1 = 4.0;
+    let date_line = 20.0;
+    let gap2 = if note_lines > 0.0 { 5.0 } else { 0.0 };
+    let note_h = note_lines * 18.0;
+    let gap3 = 12.0;
+    let buttons = 32.0;
+
+    line1 + gap1 + date_line + gap2 + note_h + gap3 + buttons
+}
+
+/// 估算一段文本在给定每行字数下占几行（按字符数粗估，中文/英文统一处理）。
+fn wrapped_lines(text: &str, chars_per_line: f32) -> usize {
+    let mut total = 0usize;
+    for line in text.lines() {
+        let n = line.chars().count() as f32;
+        total += (n / chars_per_line).ceil().max(1.0) as usize;
     }
+    total.max(1)
 }
 
 /// 主窗口所在显示器的「工作区」矩形，单位是**物理像素**（已扣掉任务栏）。
@@ -7767,13 +7840,12 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
         .rev()
         .map(|idx| {
             let popup = &app.popups[idx];
-            let has_note = !popup.note.trim().is_empty();
             // 这里存的是「内容块」高度，与窗口尺寸无关，所以不会出现「测高→改窗口→再测高」的抖动。
             let content_h = app
                 .popup_heights
                 .get(&popup.record_id)
                 .copied()
-                .unwrap_or_else(|| toast_estimate_content_h(has_note));
+                .unwrap_or_else(|| toast_estimate_content_h(&popup.title, &popup.note));
             content_h + TOAST_PAD_TOP + TOAST_PAD_BOTTOM
         })
         .collect();
@@ -7996,7 +8068,22 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
         });
     }
 
-    app.popup_heights = measured.into_iter().collect();
+    // 记录实测高度，但**不能低于按内容估算的高度**：
+    // 实测值是在「当前窗口高度」里量出来的，窗口一旦被压扁，
+    // 量到的内容高度也会跟着变小，形成负反馈（越量越小、内容重叠）。
+    // 取两者的较大值，保证窗口只会因内容增长而变高，不会自我压缩。
+    app.popup_heights = measured
+        .into_iter()
+        .map(|(id, h)| {
+            let est = app
+                .popups
+                .iter()
+                .find(|p| p.record_id == id)
+                .map(|p| toast_estimate_content_h(&p.title, &p.note))
+                .unwrap_or(h);
+            (id, h.max(est))
+        })
+        .collect();
 
     for action in actions {
         match action {

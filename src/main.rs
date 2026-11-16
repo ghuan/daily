@@ -29,6 +29,8 @@ const APP_SUBTITLE: &str = "计划与提醒";
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 const MENU_OPEN: &str = "open";
+/// 手动触发提醒（一次性弹出当前所有在提醒窗口内的记录）。
+const MENU_FIRE: &str = "fire";
 const MENU_AUTOSTART: &str = "autostart";
 const MENU_QUIT: &str = "quit";
 
@@ -147,6 +149,8 @@ static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 enum TrayAction {
     Open,
     ToggleAutostart,
+    /// 手动触发提醒：弹出**当前在提醒窗口内**的记录，不影响定时节奏。
+    FireNow,
 }
 
 fn install_tray_event_handlers(ctx: &egui::Context) {
@@ -178,6 +182,7 @@ fn install_tray_event_handlers(ctx: &egui::Context) {
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let action = match event.id.0.as_str() {
             MENU_OPEN => Some(TrayAction::Open),
+            MENU_FIRE => Some(TrayAction::FireNow),
             MENU_AUTOSTART => Some(TrayAction::ToggleAutostart),
             MENU_QUIT => {
                 // 退出。注意 process::exit 不会跑析构，TrayIcon::drop() 里的
@@ -2102,6 +2107,7 @@ impl PlanApp {
         }
         let menu = Menu::new();
         let open = MenuItem::with_id(MENU_OPEN, "打开主界面", true, None);
+        let fire = MenuItem::with_id(MENU_FIRE, "触发提醒", true, None);
         let autostart = CheckMenuItem::with_id(
             MENU_AUTOSTART,
             "开机自启",
@@ -2111,6 +2117,7 @@ impl PlanApp {
         );
         let quit = MenuItem::with_id(MENU_QUIT, "退出", true, None);
         let _ = menu.append(&open);
+        let _ = menu.append(&fire);
         let _ = menu.append(&autostart);
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&quit);
@@ -2164,6 +2171,35 @@ impl PlanApp {
         }
     }
 
+
+    /// 手动触发提醒：把**当前处于提醒窗口内**的记录一次性弹出。
+    ///
+    /// 与定时提醒的关系：
+    /// - **不改 `last_fired`**。那是定时判定的锚点，改了会打乱「窗口起点 + N×间隔」
+    ///   的槽位节奏（用户要求：手动跟自动不冲突、不影响定时计时）。
+    /// - **不写盘**。手动多弹一张卡片属于临时展示，不该产生 git 提交。
+    /// - **去重**：已有相同 record_id 的弹窗在显示时直接跳过，不重复弹。
+    /// - 只弹「未完成 / 未取消 / 当前在提醒窗口内」的记录——和自动提醒的
+    ///   可见性口径保持一致，避免手动弹出已完成或早已过期的记录。
+    fn fire_reminders_now(&mut self, ctx: &egui::Context) {
+        let now = Local::now();
+        let picked = pick_manual_popups(&self.doc.records, &self.popups, &now);
+        let added = picked.len();
+        self.popups.extend(picked);
+
+        if added == 0 {
+            self.set_status("当前没有处于提醒窗口内的记录".to_string(), false);
+            return;
+        }
+        self.set_status(format!("已手动触发 {added} 条提醒"), true);
+        if self.settings.sound {
+            notify::play();
+        }
+        ctx.request_repaint();
+        // 主窗口隐藏/最小化时也要能画出来（同上：强制跑一次完整 ui pass）
+        ctx.send_viewport_cmd(ViewportCommand::RequestPaintWhileHidden);
+    }
+
     fn handle_tray_events(&mut self, ctx: &egui::Context) {
         if !self.tray_handlers_ready {
             install_tray_event_handlers(ctx);
@@ -2177,6 +2213,7 @@ impl PlanApp {
         for action in actions {
             match action {
                 TrayAction::Open => self.show_main_window(ctx),
+                TrayAction::FireNow => self.fire_reminders_now(ctx),
                 TrayAction::ToggleAutostart => {
                     let on = !self.settings.autostart;
                     self.set_autostart(on);
@@ -3900,6 +3937,16 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                     ui.add_space(4.0);
                     if ui.add(button_ghost("管理模板")).clicked() {
                         app.page = WorkspacePage::Templates;
+                    }
+                    ui.add_space(4.0);
+                    // 手动触发提醒：弹出当前处于提醒窗口内的记录。
+                    // 不影响定时节奏（不改 last_fired），已在弹窗中的会跳过。
+                    if ui
+                        .add(button_ghost("触发提醒"))
+                        .on_hover_text("立即弹出当前处于提醒窗口内的记录（不影响定时）")
+                        .clicked()
+                    {
+                        app.fire_reminders_now(ui.ctx());
                     }
                 });
             });
@@ -6506,6 +6553,63 @@ mod workflow_tests {
     #[test]
 
     /// 弹窗高度估算：长标题/长备注必须估出更多行，否则首帧会把内容压重叠。
+
+    /// 手动触发提醒：只补弹「窗口内且未在显示」的记录，且不动 last_fired。
+    #[test]
+    fn manual_fire_respects_window_and_dedup() {
+        let now = Local::now();
+        let today = now.date_naive();
+
+        let mk = |title: &str, done: bool, last_fired: Option<chrono::DateTime<Local>>| {
+            let mut r = DayRecord {
+                id: Uuid::new_v4(),
+                template_id: None,
+                date: today,
+                title: title.to_string(),
+                tag: String::new(),
+                note: String::new(),
+                time: NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default(),
+                remind: model::RemindWindow {
+                    advance_days: 0,
+                    advance_minutes: 0,
+                    grace_days: None, // 不限 → 窗口右边界无限
+                    every_minutes: 60,
+                },
+                done,
+                done_at: None,
+                cancelled: false,
+                customized: false,
+                last_fired,
+                snooze_until: None,
+                created_at: now,
+            };
+            if done {
+                r.done_at = Some(now);
+            }
+            r
+        };
+
+        let a = mk("待办 A", false, None);
+        let b = mk("已完成 B", true, None);
+        let a_id = a.id;
+        let records = vec![a, b];
+
+        // 1) 首次手动触发：只挑未完成的 A
+        let picked = pick_manual_popups(&records, &[], &now);
+        assert_eq!(picked.len(), 1, "只应弹出未完成的记录");
+        assert_eq!(picked[0].record_id, a_id);
+
+        // 2) A 已在弹窗里 → 不重复弹
+        let picked2 = pick_manual_popups(&records, &picked, &now);
+        assert!(picked2.is_empty(), "已显示的记录不应重复弹");
+
+        // 3) 手动触发不改 last_fired：原记录仍然是 None
+        assert!(
+            records[0].last_fired.is_none(),
+            "手动触发不应写入 last_fired（会打乱定时槽位）"
+        );
+    }
+
     #[test]
     fn toast_estimate_grows_with_wrapping() {
         // 短标题无备注
@@ -7686,6 +7790,38 @@ fn toast_estimate_content_h(title: &str, note: &str) -> f32 {
     let buttons = 32.0;
 
     line1 + gap1 + date_line + gap2 + note_h + gap3 + buttons
+}
+
+/// 手动触发时，从记录里挑出「应该新弹出的那些」，纯函数便于测试。
+///
+/// 规则（与 `fire_reminders_now` 文档一致）：
+/// - 已有相同 record_id 的弹窗在显示 → 跳过（不重复弹）
+/// - 不在提醒窗口内（未完成/未取消/时间对得上）→ 跳过
+///
+/// **不读也不写 `last_fired`**，所以调用它不会影响定时提醒的槽位节奏。
+fn pick_manual_popups(
+    records: &[crate::model::DayRecord],
+    existing: &[Popup],
+    now: &chrono::DateTime<Local>,
+) -> Vec<Popup> {
+    let mut out = Vec::new();
+    for r in records {
+        if existing.iter().any(|p| p.record_id == r.id) {
+            continue;
+        }
+        if !r.in_reminder_window(now) {
+            continue;
+        }
+        out.push(Popup {
+            record_id: r.id,
+            title: r.title.clone(),
+            tag: r.tag.clone(),
+            note: r.note.clone(),
+            date: r.date,
+            time: r.time,
+        });
+    }
+    out
 }
 
 /// 估算一段文本在给定每行字数下占几行（按字符数粗估，中文/英文统一处理）。

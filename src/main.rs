@@ -321,12 +321,16 @@ mod theme {
     pub const ACCENT_DIM: Color32 = Color32::from_rgb(79, 91, 217);
     pub const ACCENT_SOFT: Color32 = Color32::from_rgb(237, 239, 255);
     pub const OK: Color32 = Color32::from_rgb(34, 164, 111);
+    /// 「完成」按钮悬停态：绿色提亮一档（与原生版 hover 值一致）。
+    pub const OK_HOVER: Color32 = Color32::from_rgb(46, 181, 104);
     pub const OK_DIM: Color32 = Color32::from_rgb(226, 247, 237);
     pub const WARN: Color32 = Color32::from_rgb(224, 151, 44);
     pub const DANGER: Color32 = Color32::from_rgb(224, 83, 94);
     pub const TOAST_BG: Color32 = Color32::from_rgb(31, 37, 56);
     /// 深色提醒窗里的次要按钮底色 / 描边（比窗底亮一档，带描边，看得见也点得准）。
     pub const TOAST_BTN: Color32 = Color32::from_rgb(56, 66, 98);
+    /// 「知道了」按钮悬停态：灰蓝提亮一档。
+    pub const TOAST_BTN_HOVER: Color32 = Color32::from_rgb(76, 88, 126);
     pub const TOAST_BTN_STROKE: Color32 = Color32::from_rgb(110, 122, 158);
 }
 
@@ -7729,26 +7733,64 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
                             // 深色通知窗里的主操作：实心绿底 + 白字，浅绿底配白字几乎不可读。
-                            let done_btn = egui::Button::new(
-                                RichText::new("✓  完成").strong().color(Color32::WHITE),
-                            )
-                            .fill(theme::OK)
-                            .stroke(egui::Stroke::new(1.0_f32, theme::OK))
-                            .corner_radius(egui::CornerRadius::same(8))
-                            .min_size(egui::vec2(88.0, 32.0));
-                            if ui.add(done_btn).clicked() {
+                            // 悬停反馈：egui 的 Button::fill 是固定色，不会随交互变化，
+                            // 所以先按常态画一遍拿到响应，hovered 时用提亮色重绘一次
+                            // （同一帧内覆盖，用户看不到中间态）。
+                            let done_resp = ui.add(
+                                egui::Button::new(
+                                    RichText::new("✓  完成").strong().color(Color32::WHITE),
+                                )
+                                .fill(theme::OK)
+                                .stroke(egui::Stroke::new(1.0_f32, theme::OK))
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .min_size(egui::vec2(88.0, 32.0)),
+                            );
+                            let done_rect = done_resp.rect;
+                            if done_resp.hovered() {
+                                ui.painter().rect_filled(
+                                    done_rect,
+                                    egui::CornerRadius::same(8),
+                                    theme::OK_HOVER,
+                                );
+                                ui.painter().text(
+                                    done_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "✓  完成",
+                                    egui::FontId::proportional(13.0),
+                                    Color32::WHITE,
+                                );
+                            }
+                            if done_resp.clicked() {
                                 actions.push(PopupAction::Complete(popup.record_id));
                             }
-                            // 次要操作也做成实心按钮：浅一档的底色 + 亮描边 + 白字，
-                            // 在深色窗里既看得见又点得准（原来只是灰字，像说明文字）。
-                            let know_btn = egui::Button::new(
-                                RichText::new("知道了").strong().color(Color32::WHITE),
-                            )
-                            .fill(theme::TOAST_BTN)
-                            .stroke(egui::Stroke::new(1.0_f32, theme::TOAST_BTN_STROKE))
-                            .corner_radius(egui::CornerRadius::same(8))
-                            .min_size(egui::vec2(88.0, 32.0));
-                            if ui.add(know_btn).clicked() {
+
+                            ui.add_space(8.0);
+
+                            let know_resp = ui.add(
+                                egui::Button::new(
+                                    RichText::new("知道了").strong().color(Color32::WHITE),
+                                )
+                                .fill(theme::TOAST_BTN)
+                                .stroke(egui::Stroke::new(1.0_f32, theme::TOAST_BTN_STROKE))
+                                .corner_radius(egui::CornerRadius::same(8))
+                                .min_size(egui::vec2(88.0, 32.0)),
+                            );
+                            let know_rect = know_resp.rect;
+                            if know_resp.hovered() {
+                                ui.painter().rect_filled(
+                                    know_rect,
+                                    egui::CornerRadius::same(8),
+                                    theme::TOAST_BTN_HOVER,
+                                );
+                                ui.painter().text(
+                                    know_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "知道了",
+                                    egui::FontId::proportional(13.0),
+                                    Color32::WHITE,
+                                );
+                            }
+                            if know_resp.clicked() {
                                 actions.push(PopupAction::Dismiss(popup.record_id));
                             }
                         });

@@ -445,7 +445,7 @@ fn main() -> eframe::Result<()> {
         };
         toast_push(vec![card.clone()]);
         // 轮询点击回传（自测关键：验证按钮命中）
-        for _ in 0..50 {
+        for _ in 0..300 {
             std::thread::sleep(Duration::from_millis(200));
             let acts = toast_take_actions();
             if !acts.is_empty() {
@@ -1350,6 +1350,7 @@ mod native_toast {
         TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
     };
     use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
+    use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW, SetCursor};
     use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
@@ -1388,6 +1389,8 @@ mod native_toast {
         scale: f32,
         /// 按钮 hover 跟踪。
         hover_btn: i32, // 0=无 1=完成 2=知道了 3=关闭
+        /// 「已复制」提示的剩余显示帧数（右键复制后短暂显示）。
+        copied_frames: u32,
         fonts: CardFonts,
     }
 
@@ -1660,9 +1663,11 @@ mod native_toast {
             data: data.clone(),
             scale,
             hover_btn: 0,
+            copied_frames: 0,
             fonts: make_fonts(scale),
         });
         wm::SetWindowLongPtrW(hwnd, wm::GWLP_USERDATA, Box::into_raw(st) as isize);
+        wm::SetTimer(hwnd, 2, 100, None); // 卡片自己的 100ms 定时器（复制提示淡出）
         wm::ShowWindow(hwnd, wm::SW_SHOWNOACTIVATE);
         list.push((*data.record_id.as_bytes(), hwnd as isize));
     }
@@ -1792,6 +1797,7 @@ mod native_toast {
                     if hit != st.hover_btn {
                         st.hover_btn = hit;
                         InvalidateRect(hwnd, std::ptr::null(), 0);
+                        UpdateWindow(hwnd); // 立即重绘，否则 hover 要等下次 WM_PAINT
                     }
                     // 启用 WM_MOUSELEAVE 跟踪
                     let tme = TRACKMOUSEEVENT {
@@ -1808,6 +1814,29 @@ mod native_toast {
                 if let Some(st) = state.as_mut() {
                     st.hover_btn = 0;
                     InvalidateRect(hwnd, std::ptr::null(), 0);
+                }
+                0
+            }
+            wm::WM_RBUTTONUP => {
+                // 右键 = 复制整张卡片的文字（GDI 绘制的文字没有原生可选性，
+                // 这是拿到文本的入口）。复制后卡片内短暂显示「已复制」反馈。
+                if let Some(st) = state.as_mut() {
+                    let text = card_plain_text(&st.data);
+                    copy_to_clipboard(hwnd, &text);
+                    st.copied_frames = 10; // ~1 秒（WM_TIMER 100ms 一帧）
+                    InvalidateRect(hwnd, std::ptr::null(), 0);
+                    UpdateWindow(hwnd);
+                }
+                0
+            }
+            wm::WM_TIMER => {
+                // 卡片自己的倒计时定时器（用于「已复制」提示淡出）
+                if let Some(st) = state.as_mut() {
+                    if st.copied_frames > 0 {
+                        st.copied_frames -= 1;
+                        InvalidateRect(hwnd, std::ptr::null(), 0);
+                        UpdateWindow(hwnd);
+                    }
                 }
                 0
             }
@@ -1940,10 +1969,11 @@ mod native_toast {
         let btn2 = RECT { left: btn2_x, top: by, right: btn2_x + bw, bottom: by + bh };
 
         let hov = st.hover_btn;
-        draw_button(mem, &btn1, "✓ 完成", COL_OK, if hov == 1 { COL_OK_HOVER } else { COL_OK }, 0, st, w);
-        draw_button(mem, &btn2, "知道了", COL_BTN, COL_BTN, if hov == 2 { COL_BTN_HOVER } else { 0 }, st, w);
+        draw_button(mem, &btn1, "✓ 完成", COL_OK, st, hov == 1);
+        draw_button(mem, &btn2, "知道了", COL_BTN, st, hov == 2);
 
         // 右上角关闭 icon
+        let y_top_close_hint = int(PAD_T_PT as f32 * s) + int(26.0 * s);
         let icon_r = int(11.0 * s);
         let iy = int(PAD_T_PT as f32 * s) + icon_r + int(2.0 * s);
         let ix2 = w - pad_l - icon_r;
@@ -1962,7 +1992,18 @@ mod native_toast {
             draw_text_w(mem, sym, &mut sx, &mut sy, ix + icon_r, false);
         }
 
-                gdi::SelectClipRgn(mem, std::ptr::null_mut());
+                // 「已复制」提示：右键复制后短暂显示
+        if st.copied_frames > 0 {
+            SelectObject(mem, st.fonts.date as *mut _);
+            SetTextColor(mem, COL_OK);
+            let tip = "已复制 ✓";
+            let tw = gdi::text_extent(mem, tip);
+            let mut tx = w - pad_l - tw.0 - int(4.0 * s);
+            let mut ty = y_top_close_hint + int(2.0 * s);
+            draw_text_w(mem, tip, &mut tx, &mut ty, w - pad_l, false);
+        }
+
+        gdi::SelectClipRgn(mem, std::ptr::null_mut());
         DeleteObject(rgn as *mut _);
 
         // 全量拷到屏幕：**必须**在还原/删除 mem DC 之前做，
@@ -1971,7 +2012,15 @@ mod native_toast {
         // 自测快照：--toast-test 时把渲染结果落成 PNG，用于验证「画了什么」
         // （只看窗口是否存在/位置是否正确是不够的——曾因此漏掉空白窗口的 bug）。
         if std::env::args().any(|a| a == "--toast-test") {
-            save_dib_png(mem, w, h, "toast_render.png");
+            // 每次重绘都覆盖：便于抓 hover / 复制提示等动态状态
+            let name = if st.hover_btn != 0 {
+                "toast_render_hover.png"
+            } else if st.copied_frames > 0 {
+                "toast_render_copied.png"
+            } else {
+                "toast_render.png"
+            };
+            save_dib_png(mem, w, h, name);
         }
 
         let _blt = gdi::BitBlt(hdc, 0, 0, w, h, mem, 0, 0, 0x00CC0020 /*SRCCOPY*/);
@@ -2034,13 +2083,20 @@ mod native_toast {
     }
 
 
+    /// 画一个实心圆角按钮。`hovered` 为真时底色提亮并带描边（鼠标悬停反馈）。
     fn draw_button(
-        hdc: HDC, r: &RECT, text: &str, fill: COLORREF, _stroke: COLORREF,
-        hover_fill: COLORREF, st: &CardState, _w: i32,
+        hdc: HDC, r: &RECT, text: &str, fill: COLORREF, st: &CardState, hovered: bool,
     ) {
         unsafe {
-            let brush = CreateSolidBrush(if hover_fill != 0 { hover_fill } else { fill });
-            let pen = CreatePen(0, 1, if hover_fill != 0 { COL_BTN_STROKE } else { fill });
+            // 悬停：底色提亮一档 + 描边，视觉上明确「可点」。
+            let bg = if hovered {
+                if fill == COL_OK { COL_OK_HOVER } else { COL_BTN_HOVER }
+            } else {
+                fill
+            };
+            let border = if hovered { COL_BTN_STROKE } else { fill };
+            let brush = CreateSolidBrush(bg);
+            let pen = CreatePen(0, 1, border);
             let ob = gdi::SelectObject(hdc, brush as *mut _);
             let op = gdi::SelectObject(hdc, pen as *mut _);
             gdi::RoundRect(hdc, r.left, r.top, r.right, r.bottom,
@@ -2078,6 +2134,54 @@ mod native_toast {
     }
 
     fn int(v: f32) -> i32 { v.round() as i32 }
+
+
+    /// 卡片可复制的纯文本（标签 / 标题 / 日期 / 备注）。
+    fn card_plain_text(d: &ToastData) -> String {
+        let mut s = String::new();
+        let tag = d.tag.trim();
+        if !tag.is_empty() {
+            s.push('[');
+            s.push_str(tag);
+            s.push_str("] ");
+        }
+        s.push_str(&d.title);
+        s.push('\n');
+        s.push_str(&d.date_line);
+        if !d.note.trim().is_empty() {
+            s.push('\n');
+            s.push_str(&d.note);
+        }
+        s
+    }
+
+    /// 写入剪贴板（CF_UNICODETEXT）。
+    fn copy_to_clipboard(hwnd: HWND, text: &str) {
+        use windows_sys::Win32::System::DataExchange::{
+            CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+        };
+        use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+        unsafe {
+            if OpenClipboard(hwnd) == 0 {
+                return;
+            }
+            EmptyClipboard();
+            let mut utf16: Vec<u16> = text.encode_utf16().collect();
+            utf16.push(0);
+            let bytes = utf16.len() * 2;
+            let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if !hmem.is_null() {
+                let ptr = GlobalLock(hmem) as *mut u16;
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr, utf16.len());
+                    GlobalUnlock(hmem);
+                    // CF_UNICODETEXT = 13
+                    SetClipboardData(13, hmem);
+                }
+            }
+            CloseClipboard();
+        }
+    }
 
     /// 命中测试：位置必须与 `paint_card` 使用**同一套**尺寸来源（真实客户区），
     /// 否则估算高度与实际不符时，按钮会被画在窗口外、点了没反应。

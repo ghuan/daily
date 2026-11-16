@@ -2715,6 +2715,24 @@ fn git_ready(settings: &Settings) -> bool {
 }
 
 impl eframe::App for PlanApp {
+    /// 清屏色。**弹窗窗口**（提醒卡片）建窗后会先用这个颜色清一次再画内容，
+    /// 如果沿用 eframe 默认的 rgba(12,12,12,180)，卡片出现前会闪一帧半透明深灰。
+    /// 这里统一返回卡片底色 `theme::TOAST_BG`：
+    /// - 提醒卡片窗口：首帧就是要显示的底色，肉眼无缝；
+    /// - 主窗口：底色被 CentralPanel 完全覆盖，看不出差别。
+    ///
+    /// 注意不能返回带 alpha 的颜色 —— 卡片窗口不是透明窗口，半透明清屏在
+    /// 深色桌面上会呈现为一层灰雾。
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        let c = theme::TOAST_BG;
+        [
+            c.r() as f32 / 255.0,
+            c.g() as f32 / 255.0,
+            c.b() as f32 / 255.0,
+            1.0,
+        ]
+    }
+
     /// 后台心跳：**每帧都会调用**，且窗口最小化/被遮挡时 eframe 走
     /// `update_logic_only` 也会持续调用这里（前提是有 repaint 请求，
     /// 见函数末尾的 request_repaint_after）。

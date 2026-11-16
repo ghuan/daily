@@ -8040,6 +8040,11 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
             .with_title("")
             .with_inner_size([CARD_W, h])
             .with_position(seed_pos)
+            // 先隐藏建窗，首帧定位校正后再显示。
+            // 原因：egui-winit 建窗时是 `with_visible(true)`，窗口会先出现在
+            // 系统默认位置，再被移到右下角 —— 表现为一闪（用户反馈）。
+            // 设成 false 后由首帧回调里的 ViewportCommand::Visible(true) 打开。
+            .with_visible(false)
             .with_resizable(false)
             .with_decorations(false)
             .with_always_on_top()
@@ -8069,6 +8074,16 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                 .unwrap_or(true);
             if needs_move {
                 vctx.send_viewport_cmd(ViewportCommand::OuterPosition(target));
+            }
+            // 建窗时是 with_visible(false)，位置算好（必要时已发 OuterPosition）后
+            // 再显示，避免窗口先出现在默认位置、再跳到右下角造成闪烁。
+            // 只在当前不可见时发一次，稳定后不再重复调用。
+            let not_visible = vctx
+                .input(|i| i.viewport().visible())
+                .map(|v| !v)
+                .unwrap_or(false);
+            if not_visible {
+                vctx.send_viewport_cmd(ViewportCommand::Visible(true));
             }
             egui::CentralPanel::default()
                 .frame(

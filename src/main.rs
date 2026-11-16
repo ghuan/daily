@@ -1482,7 +1482,9 @@ fn demo_doc() -> Option<Doc> {
 /// 也不影响真实提醒数据。用于人工检查卡片样式与按钮 hover。
 fn demo_popups() -> Vec<Popup> {
     // 只有显式 --demo-popups 才弹演示卡片：截主界面时不该有弹窗遮挡。
-    if !std::env::args().any(|a| a == "--demo-popups") {
+    // --demo-popups=1 只弹一张（做展示图更好看）。
+    let only_one = std::env::args().any(|a| a == "--demo-popups=1");
+    if !only_one && !std::env::args().any(|a| a == "--demo-popups") {
         return Vec::new();
     }
     let today = Local::now().date_naive();
@@ -1512,6 +1514,9 @@ fn demo_popups() -> Vec<Popup> {
             time: NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default(),
         },
     ]
+    .into_iter()
+    .take(if only_one { 1 } else { 3 })
+    .collect()
 }
 
 struct PlanApp {

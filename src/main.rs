@@ -2319,6 +2319,12 @@ impl PlanApp {
             self.popups.retain(|p| !stale.contains(&p.record_id));
         }
 
+        // --demo：不按真实记录自动弹窗。演示数据里的记录是给日历/统计页
+        // 看的，若同时被 tick 触发，会和 demo_popups() 的卡片叠在一起
+        // （实测弹了 6 张而不是 4 张）。
+        if std::env::args().any(|a| a == "--demo") {
+            return;
+        }
         let mut fired = Vec::new();
         // 弹窗已存在、只是刷新了 last_fired 的记录：也要落盘，否则下次启动会重算时间。
         let mut state_only = false;
@@ -7930,10 +7936,15 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                         } else {
                             tag_color(tag)
                         };
-                        // 用 horizontal_top：所有元素**顶端对齐**。
-                        // 用普通 horizontal 时元素垂直居中，标题换行变高会把
-                        // 标签和关闭按钮往中间推，长标题行数多时相互遮挡。
-                        ui.horizontal_top(|ui| {
+                        // 显式用 Layout::left_to_right(Align::Min)：
+                        // - `horizontal()` 的主轴对齐是 Center，元素会垂直居中，
+                        //   标题换行变高时标签/按钮被推到中间；
+                        // - `horizontal_top()` 只设了 cross_align=Min，主轴仍是 Center，
+                        //   标题占 3 行时标签仍会被居中（实测踩过）。
+                        // 只有直接指定 left_to_right(Align::Min) 才是真正的顶端对齐。
+                        let row_size = ui.available_size_before_wrap();
+                        let row_layout = egui::Layout::left_to_right(egui::Align::Min);
+                        ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             let (dot, _) =
                                 ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());

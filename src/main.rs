@@ -1488,34 +1488,50 @@ fn demo_popups() -> Vec<Popup> {
         return Vec::new();
     }
     let today = Local::now().date_naive();
+    // 四张卡片覆盖换行极端情况：
+    // 1) 短标题 + 短备注      —— 基线
+    // 2) 长标题（2~3 行）+ 短备注
+    // 3) 短标题 + 长备注（多行）
+    // 4) 长标题 + 长备注      —— 最容易压重叠的组合
+    let long_title =
+        "宁波中慢病渗透测试整改项目第二轮回归验证与漏洞复测工作安排（含七层 weekly 后端全部接口）";
+    let long_note = "七层-weekly-1 后端漏洞验证：需覆盖用户中心、医嘱服务、检验报告、 结算对账四条链路；重点复测上一轮发现的越权访问与 SQL 注入问题，并补充慢病随访模块的 并发场景。完成后把结果整理成表格同步给测试组，同时更新项目周报与风险清单。";
     vec![
         Popup {
             record_id: Uuid::new_v4(),
             tag: "普通事项".into(),
-            title: "宁波中慢病渗透测试整改".into(),
-            note: "七层-weekly-1 后端漏洞验证".into(),
+            title: "买菜".into(),
+            note: "西红柿、鸡蛋".into(),
             date: today,
             time: NaiveTime::from_hms_opt(9, 0, 0).unwrap_or_default(),
         },
         Popup {
             record_id: Uuid::new_v4(),
             tag: "工作".into(),
-            title: "新华医嘱独立服务开发".into(),
-            note: "接口联调 + 回归验证".into(),
+            title: long_title.to_string(),
+            note: "短备注".into(),
             date: today + ChronoDuration::days(1),
             time: NaiveTime::from_hms_opt(10, 30, 0).unwrap_or_default(),
         },
         Popup {
             record_id: Uuid::new_v4(),
             tag: "生日".into(),
-            title: "一条标题比较长的提醒，用来验证标题换行时卡片高度是否自适应".into(),
-            note: String::new(),
+            title: "牙医复诊".into(),
+            note: long_note.to_string(),
             date: today + ChronoDuration::days(3),
             time: NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default(),
         },
+        Popup {
+            record_id: Uuid::new_v4(),
+            tag: "每日计划".into(),
+            title: long_title.to_string(),
+            note: long_note.to_string(),
+            date: today + ChronoDuration::days(5),
+            time: NaiveTime::from_hms_opt(14, 0, 0).unwrap_or_default(),
+        },
     ]
     .into_iter()
-    .take(if only_one { 1 } else { 3 })
+    .take(if only_one { 1 } else { 4 })
     .collect()
 }
 
@@ -2823,8 +2839,9 @@ fn button_mini(text: &str) -> egui::Button<'static> {
 ///
 /// 用 painter 自绘而不是渲染 `✕` 字符：深色底上线条颜色可控，
 /// 也不怕字体缺字显示成方框。
-/// 关闭图标区域的预留宽度（两个图标 + 间距），标题换行时要用它避让。
-const CLOSE_AREA: f32 = 56.0;
+/// 关闭图标区域的预留宽度：两个图标（直径 22）+ 间距 2 + 右侧留白 6 = 52，
+/// 再留 8pt 呼吸空间 → 60。标题换行时用它避让，避免第 3 行顶到图标上。
+const CLOSE_AREA: f32 = 60.0;
 
 /// 在给定矩形里画一个关闭图标（不含交互），供绝对定位版复用。
 fn draw_close_icon(ui: &egui::Ui, rect: egui::Rect, icon: CloseIcon, color: Color32) {
@@ -7913,11 +7930,19 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                         } else {
                             tag_color(tag)
                         };
-                        ui.horizontal(|ui| {
+                        // 用 horizontal_top：所有元素**顶端对齐**。
+                        // 用普通 horizontal 时元素垂直居中，标题换行变高会把
+                        // 标签和关闭按钮往中间推，长标题行数多时相互遮挡。
+                        ui.horizontal_top(|ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             let (dot, _) =
                                 ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                            ui.painter().circle_filled(dot.center(), 3.5, tag_color);
+                            // horizontal_top 下色点贴顶，下移 4pt 让它与标签文字视觉居中对齐
+                            ui.painter().circle_filled(
+                                dot.center() + egui::vec2(0.0, 4.0),
+                                3.5,
+                                tag_color,
+                            );
                             ui.label(
                                 RichText::new(if tag.is_empty() { "提醒" } else { tag })
                                     .size(11.5)
@@ -7934,7 +7959,11 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                             // 用 `add_sized` 限制最大宽度（右侧预留 CLOSE_AREA 给
                             // 两个绝对定位的关闭图标），这样标题仍在标签右侧、
                             // 同一行起始，换行后也不会压到关闭按钮。
-                            let title_w = (ui.available_width() - CLOSE_AREA).max(60.0);
+                            // 标题宽度按**卡片总宽**算，而不是 available_width()：
+                            // 后者在 horizontal 内部已被扣掉标签/分隔符宽度，
+                            // 标签一长标题就被挤窄、换行更多，反而不稳定。
+                            // 卡片 420 - 左右内边距 32 - 标签区预留 78 - 关闭区 60
+                            let title_w = (420.0 - 32.0 - 78.0 - CLOSE_AREA).max(80.0);
                             // 用 wrap + ui.scope 限定最大宽度，让标题自然左对齐换行。
                             // （add_sized 会把 Label 撑满固定宽度并居中，视觉上标题
                             //   就跑到行中间去了 —— 实测踩过两次，别再用。）

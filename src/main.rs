@@ -444,9 +444,25 @@ fn main() -> eframe::Result<()> {
             note: "这是一张测试卡片：验证独立 Win32 窗口渲染与按钮回传。".into(),
         };
         toast_push(vec![card.clone()]);
-        std::thread::sleep(Duration::from_secs(10));
-        toast_push(vec![]); // 10 秒后自动收走
-        std::thread::sleep(Duration::from_secs(1));
+        // 轮询点击回传（自测关键：验证按钮命中）
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(200));
+            let acts = toast_take_actions();
+            if !acts.is_empty() {
+                let desc: Vec<String> = acts
+                    .iter()
+                    .map(|a| match a {
+                        PopupAction::Complete(_) => "COMPLETE".to_string(),
+                        PopupAction::Dismiss(_) => "DISMISS".to_string(),
+                        PopupAction::DismissAll => "DISMISS_ALL".to_string(),
+                    })
+                    .collect();
+                eprintln!("[toast-test] ACTION received: {}", desc.join(","));
+                break;
+            }
+        }
+        toast_push(vec![]);
+        std::thread::sleep(Duration::from_millis(300));
         return Ok(());
     }
 
@@ -1334,6 +1350,7 @@ mod native_toast {
         TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
     };
     use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW, SetCursor};
     use windows_sys::Win32::UI::WindowsAndMessaging as wm;
 
     // ── 尺寸/颜色常量：与 egui 卡片完全一致（theme:: + ui_popups 提取）──
@@ -1429,21 +1446,38 @@ mod native_toast {
     }
 
     /// 每张卡当前高度（物理像素）。备注按字符宽度估算换行行数。
+    /// 卡片高度（物理像素）：按**逐行累加**的布局常量算，而不是拍一个总高。
+    ///
+    /// 之前的实现用固定估算值（106/132pt），在缩放 100%、备注多行、
+    /// 或标题换行时会偏小，导致底部按钮被画到窗口之外（点击无反应）。
+    /// 这里把 paint_card 用到的每一段高度都显式相加，保证「窗口高度 ≥ 内容高度」。
     fn card_height(data: &ToastData, scale: f32) -> i32 {
+        let s = scale;
+        let pad_t = PAD_T_PT as f32 * s;
+        let pad_b = PAD_B_PT as f32 * s;
+        let line1 = 22.0 * s; // 标签 + 标题行
+        let gap1 = 3.0 * s;
+        let date_line = 20.0 * s;
+        let gap2 = 4.0 * s;
+        let note_line = 18.0 * s;
+        let gap3 = 12.0 * s;
+        let btn = 32.0 * s;
+
         let note_lines = if data.note.trim().is_empty() {
-            0
+            0.0
         } else {
-            // 估算：420pt 宽卡片内容区 ~388pt，中文字符 ~12pt 宽。
-            let char_w = 12.0 * scale;
-            let per_line = ((CARD_W_PT - 32.0) * scale / char_w).max(8.0) as usize;
-            note_len_lines(&data.note, per_line)
+            let char_w = 12.0 * s;
+            let per_line = ((CARD_W_PT - 32.0) * s / char_w).max(8.0) as usize;
+            note_len_lines(&data.note, per_line) as f32
         };
-        let content = if note_lines == 0 {
-            EST_H_NO_NOTE_PT
-        } else {
-            EST_H_NOTE_PT + 20.0 * (note_lines.saturating_sub(1)) as f32
-        };
-        (content * scale) as i32
+        // 标题可能换行：按标题字符数估算额外行数（宽约 420-32-60）
+        let title_chars = data.title.chars().count() as f32;
+        let title_per_line = ((CARD_W_PT - 92.0) * s / (15.0 * s)).max(6.0);
+        let title_extra = ((title_chars / title_per_line).ceil() - 1.0).max(0.0) * 19.0 * s;
+
+        let total = pad_t + line1 + title_extra + gap1 + date_line + gap2
+            + note_lines * note_line + gap3 + btn + pad_b;
+        total.ceil() as i32
     }
 
     /// 备注换行估算（含英文单词不切分近似：整串长度/每行字符数 + 换行符）。
@@ -1488,7 +1522,7 @@ mod native_toast {
                 cbWndExtra: 0,
                 hInstance: std::ptr::null_mut(),
                 hIcon: std::ptr::null_mut(),
-                hCursor: std::ptr::null_mut(),
+                hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
                 hbrBackground: std::ptr::null_mut(),
                 lpszMenuName: std::ptr::null(),
                 lpszClassName: host_class.as_ptr(),
@@ -1503,7 +1537,7 @@ mod native_toast {
                 cbWndExtra: 0,
                 hInstance: std::ptr::null_mut(),
                 hIcon: std::ptr::null_mut(),
-                hCursor: std::ptr::null_mut(),
+                hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
                 hbrBackground: std::ptr::null_mut(),
                 lpszMenuName: std::ptr::null(),
                 lpszClassName: card_class.as_ptr(),
@@ -1544,15 +1578,8 @@ mod native_toast {
     /// WM_TIMER：非阻塞轮询 rx；有 Sync 就 diff 建/销卡片窗；然后统一重定位。
     unsafe fn pump_sync(hwnd: HWND, state: &mut HostState) {
         let mut latest: Option<ToastCmd> = None;
-        let mut n = 0usize;
         while let Ok(cmd) = state.rx.try_recv() {
-            n += 1;
             latest = Some(cmd);
-        }
-        if n > 0 {
-            let _ = std::fs::OpenOptions::new().create(true).append(true)
-                .open("toast.log").and_then(|mut f| std::io::Write::write_all(&mut f,
-                    format!("pump got {n} cmds\n").as_bytes()));
         }
         if let Some(ToastCmd::CloseAll) = latest {
             destroy_all(hwnd);
@@ -1594,9 +1621,11 @@ mod native_toast {
     }
 
     unsafe fn create_card(data: &ToastData, list: &mut Vec<([u8; 16], isize)>) {
-        let scale = dpi_scale();
-        let h = card_height(data, scale);
-        let w = int(CARD_W_PT * scale);
+        // 先按 1.0 建窗（此时还不知道所在显示器 DPI），建好后用
+        // GetDpiForWindow 取真实缩放比，再调整窗口尺寸与字体。
+        let scale_seed = 1.0f32;
+        let h = card_height(data, scale_seed);
+        let w = int(CARD_W_PT * scale_seed);
         let card_class: Vec<u16> = "BellToastCard\0".encode_utf16().collect();
         let title16: Vec<u16> = "BellToast\0".encode_utf16().collect();
         let hwnd = wm::CreateWindowExW(
@@ -1611,11 +1640,22 @@ mod native_toast {
             std::ptr::null(),
         );
         if hwnd.is_null() {
-            let _ = std::fs::OpenOptions::new().create(true).append(true)
-                .open("toast.log").and_then(|mut f| std::io::Write::write_all(&mut f,
-                    format!("create_card failed\n").as_bytes()));
-            return;
+                return;
         }
+        // 建好窗口后取真实 DPI，调整尺寸并重建字体（保证 150% 下卡片是 630px 宽）。
+        let scale = dpi_scale(hwnd);
+        let real_w = int(CARD_W_PT * scale);
+        let real_h = card_height(data, scale);
+        wm::SetWindowPos(
+            hwnd,
+            wm::HWND_TOPMOST,
+            0,
+            0,
+            real_w,
+            real_h,
+            wm::SWP_NOMOVE | wm::SWP_NOACTIVATE,
+        );
+
         let st = Box::new(CardState {
             data: data.clone(),
             scale,
@@ -1646,7 +1686,7 @@ mod native_toast {
             return;
         }
         let work_r = mi.rcWork;
-        let scale = dpi_scale();
+        let scale = dpi_scale(list[0].1 as HWND);
         let margin = int(MARGIN_PT * scale);
         let gap = int(GAP_PT * scale);
         let mut bottom = work_r.bottom - margin;
@@ -1683,12 +1723,15 @@ mod native_toast {
         }
     }
 
-    fn dpi_scale() -> f32 {
+    /// 卡片缩放比 = 该窗口所在显示器的 DPI / 96。
+    ///
+    /// **必须**用 `GetDpiForWindow(hwnd)` 而不是 `GetDpiForSystem()`：
+    /// 后者要求进程声明了 DPI 感知才返回真实值，否则一直是 96（=1.0），
+    /// 卡片就会按 100% 尺寸画在 150% 的桌面上（实测踩过：420px 而非 630px）。
+    fn dpi_scale(hwnd: HWND) -> f32 {
         unsafe {
-            use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
-            // toast 线程没有窗口可查；用系统 DPI（每用户会话固定，RDP 重连后
-            // WM_TIMER 里 relayout 每次重取，自动更新）。
-            let dpi = GetDpiForSystem();
+            use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
+            let dpi = if hwnd.is_null() { GetDpiForSystem() } else { GetDpiForWindow(hwnd) };
             if dpi >= 48 { dpi as f32 / 96.0 } else { 1.0 }
         }
     }
@@ -1699,12 +1742,6 @@ mod native_toast {
         match msg {
             wm::WM_TIMER => {
                 if wparam == 1 {
-                    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        let _ = std::fs::OpenOptions::new().create(true).append(true)
-                            .open("toast.log").and_then(|mut f| std::io::Write::write_all(&mut f,
-                                b"wm_timer fired\n"));
-                    }
                     let state = wm::GetWindowLongPtrW(hwnd, wm::GWLP_USERDATA) as *mut HostState;
                     if !state.is_null() {
                         pump_sync(hwnd, &mut *state);
@@ -1734,16 +1771,24 @@ mod native_toast {
             wm::WM_PAINT => {
                 let mut ps: PAINTSTRUCT = std::mem::zeroed();
                 let hdc = BeginPaint(hwnd, &mut ps);
-                if let Some(st) = state.as_ref() {
+                        if let Some(st) = state.as_ref() {
                     paint_card(hwnd, hdc, st, &ps.rcPaint);
                 }
                 EndPaint(hwnd, &ps);
                 0
             }
+            wm::WM_SETCURSOR => {
+                // 必须显式设置光标：窗口类 hCursor 为 null 时不处理本消息，
+                // Windows 会用「程序忙」光标（带箭头的转圈），用户看到的就是
+                // 「鼠标移上去点不了、一直是加载状态」。
+                SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_ARROW));
+                1 // 表示已处理
+            }
+            wm::WM_ERASEBKGND => 1, // 自绘，禁止系统擦除背景
             wm::WM_MOUSEMOVE => {
                 if let Some(st) = state.as_mut() {
                     let (x, y) = (lparam as i16 as i32, (lparam >> 16) as i16 as i32);
-                    let hit = hit_test(st, x, y);
+                    let hit = hit_test(hwnd, st, x, y);
                     if hit != st.hover_btn {
                         st.hover_btn = hit;
                         InvalidateRect(hwnd, std::ptr::null(), 0);
@@ -1770,7 +1815,7 @@ mod native_toast {
             wm::WM_LBUTTONUP => {
                 if let Some(st) = state.as_mut() {
                     let (x, y) = (lparam as i16 as i32, (lparam >> 16) as i16 as i32);
-                    match hit_test(st, x, y) {
+                    match hit_test(hwnd, st, x, y) {
                         1 => push_action(PopupAction::Complete(st.data.record_id)),
                         2 => push_action(PopupAction::Dismiss(st.data.record_id)),
                         3 => push_action(PopupAction::Dismiss(st.data.record_id)),
@@ -1803,6 +1848,7 @@ mod native_toast {
         let h = rc.bottom - rc.top;
         let s = st.scale;
 
+
         // 双缓冲
         let mem = gdi::CreateCompatibleDC(hdc);
         let bmp = gdi::CreateCompatibleBitmap(hdc, w, h);
@@ -1812,7 +1858,7 @@ mod native_toast {
         let bg_brush = CreateSolidBrush(COL_BG);
         let rgn = gdi::CreateRoundRectRgn(0, 0, w + 1, h + 1, int(12.0 * s), int(12.0 * s));
         gdi::SelectClipRgn(mem, rgn);
-        let mut full = RECT { left: 0, top: 0, right: w, bottom: h };
+                let mut full = RECT { left: 0, top: 0, right: w, bottom: h };
         FillRect(mem, &full, bg_brush);
         DeleteObject(bg_brush as *mut _);
 
@@ -1825,7 +1871,7 @@ mod native_toast {
         gdi::SelectObject(mem, old_pen);
         DeleteObject(pen as *mut _);
 
-        let pad_l = int(PAD_L_PT as f32 * s);
+                let pad_l = int(PAD_L_PT as f32 * s);
         let mut y = int(PAD_T_PT as f32 * s);
 
         // ── 第 1 行：色点 + 标签 · 标题 …… 右上关闭 ──
@@ -1834,7 +1880,9 @@ mod native_toast {
         let tag_c = if tag_empty { COL_TAG_DEFAULT } else { tag_color(tag) };
         let dot_r = int(3.5 * s);
         let line1_h = int(22.0 * s);
-        let dot_cy = y + line1_h / 2;
+        // 色点垂直对齐「标签文字」的视觉中线：标签字体高约 11.5pt，
+        // 用 11.5/2 而不是整个 22pt 行高的一半（否则点偏高，实测偏上）。
+        let dot_cy = y + int(11.5 * s / 2.0) + int(1.0 * s);
         let dot_brush = CreateSolidBrush(tag_c);
         let dot_pen = CreatePen(0, 1, tag_c);
         let old_dot_brush = gdi::SelectObject(mem, dot_brush as *mut _);
@@ -1876,7 +1924,7 @@ mod native_toast {
             SelectObject(mem, st.fonts.note as *mut _);
             SetTextColor(mem, COL_NOTE);
             y += int(4.0 * s);
-            let note = clip_note(&st.data.note, NOTE_MAX_LINES);
+                    let note = clip_note(&st.data.note, NOTE_MAX_LINES);
             let rect = RECT { left: pad_l, top: y, right: w - pad_l, bottom: h - int(PAD_B_PT as f32 * s) - int(36.0 * s) };
             let mut dr = rect;
             DrawTextW(mem, note.as_utf16_ptr(), -1, &mut dr, DT_NOPREFIX | DT_WORDBREAK as u32);
@@ -1884,7 +1932,7 @@ mod native_toast {
         }
 
         // ── 按钮行（底部）──
-        let bh = int(32.0 * s);
+                let bh = int(32.0 * s);
         let bw = int(88.0 * s);
         let by = h - int(PAD_B_PT as f32 * s) - bh;
         let btn1 = RECT { left: pad_l, top: by, right: pad_l + bw, bottom: by + bh };
@@ -1900,9 +1948,7 @@ mod native_toast {
         let iy = int(PAD_T_PT as f32 * s) + icon_r + int(2.0 * s);
         let ix2 = w - pad_l - icon_r;
         let ix1 = ix2 - int(2.0 * s) - 2 * icon_r;
-        for (ix, id) in [(ix1, 3i32), (ix2, 3i32)] {
-            let hover = hov == id && hover_in(st, ix, iy, icon_r);
-            let _ = hover;
+        for (ix, _id) in [(ix1, 3i32), (ix2, 3i32)] {
             let pen = CreatePen(0, 1, COL_SEP);
             let old_p = gdi::SelectObject(mem, pen as *mut _);
             gdi::Ellipse(mem, ix - icon_r, iy - icon_r, ix + icon_r, iy + icon_r);
@@ -1910,23 +1956,83 @@ mod native_toast {
             DeleteObject(pen as *mut _);
             SelectObject(mem, st.fonts.icon as *mut _);
             SetTextColor(mem, COL_DATE);
-            let sym = if ix == ix1 { "✕" } else { "✕" };
+            let sym = "✕";
             let mut sx = ix - int(5.0 * s);
             let mut sy = iy - int(8.0 * s);
             draw_text_w(mem, sym, &mut sx, &mut sy, ix + icon_r, false);
         }
 
-        gdi::SelectClipRgn(mem, std::ptr::null_mut());
+                gdi::SelectClipRgn(mem, std::ptr::null_mut());
         DeleteObject(rgn as *mut _);
+
+        // 全量拷到屏幕：**必须**在还原/删除 mem DC 之前做，
+        // 否则 BitBlt 的源 DC 已失效，窗口会显示为空白（踩过的坑）。
+        // 自测：把渲染结果直接落成 PNG（验证"画了什么"而不只是"窗口在不在"）
+        // 自测快照：--toast-test 时把渲染结果落成 PNG，用于验证「画了什么」
+        // （只看窗口是否存在/位置是否正确是不够的——曾因此漏掉空白窗口的 bug）。
+        if std::env::args().any(|a| a == "--toast-test") {
+            save_dib_png(mem, w, h, "toast_render.png");
+        }
+
+        let _blt = gdi::BitBlt(hdc, 0, 0, w, h, mem, 0, 0, 0x00CC0020 /*SRCCOPY*/);
 
         gdi::SelectObject(mem, old_bmp);
         gdi::DeleteObject(bmp as *mut _);
         gdi::DeleteDC(mem);
-        // 全量拷到屏幕
-        gdi::BitBlt(hdc, 0, 0, w, h, mem, 0, 0, 0x00CC0020 /*SRCCOPY*/);
+
+        // 诊断：确认拷贝成功 + 目标 DC 上的实际像素
+        let dc_px = gdi::GetPixel(hdc, 10, 10);
     }
 
-    fn hover_in(_st: &CardState, _x: i32, _y: i32, _r: i32) -> bool { false }
+
+    /// 把 mem DC 的内容存成 PNG（仅自测用）。
+    ///
+    /// 做法：建第二个 memDC + DIB 选区，把源 memDC BitBlt 过去，读 DIB 像素。
+    /// （直接在同一 DC 内 BitBlt 是自拷贝，等于没做事。）
+    unsafe fn save_dib_png(src_mem: HDC, w: i32, h: i32, path: &str) {
+        use windows_sys::Win32::Graphics::Gdi::{
+            CreateDIBSection, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
+        };
+        if w <= 0 || h <= 0 {
+            return;
+        }
+        let mem2 = gdi::CreateCompatibleDC(src_mem);
+        if mem2.is_null() {
+            return;
+        }
+        let mut bi: BITMAPINFO = std::mem::zeroed();
+        bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        bi.bmiHeader.biWidth = w;
+        bi.bmiHeader.biHeight = -h;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(mem2, &bi, DIB_RGB_COLORS, &mut bits, std::ptr::null_mut(), 0);
+        if dib.is_null() || bits.is_null() {
+            gdi::DeleteDC(mem2);
+            return;
+        }
+        let old = gdi::SelectObject(mem2, dib as *mut _);
+        // 源 memDC → DIB
+        gdi::BitBlt(mem2, 0, 0, w, h, src_mem, 0, 0, 0x00CC0020);
+        gdi::SelectObject(mem2, old);
+
+        let need = (w * h * 4) as usize;
+        let slice = std::slice::from_raw_parts(bits as *const u8, need);
+        let mut buf = Vec::with_capacity((w * h * 3) as usize);
+        for px in slice.chunks_exact(4) {
+            buf.push(px[2]);
+            buf.push(px[1]);
+            buf.push(px[0]);
+        }
+        if let Some(img) = image::RgbImage::from_raw(w as u32, h as u32, buf) {
+            let _ = img.save(path);
+        }
+        DeleteObject(dib as *mut _);
+        gdi::DeleteDC(mem2);
+    }
+
 
     fn draw_button(
         hdc: HDC, r: &RECT, text: &str, fill: COLORREF, _stroke: COLORREF,
@@ -1946,7 +2052,7 @@ mod native_toast {
             SetBkMode(hdc, 1 /*TRANSPARENT*/);
             SelectObject(hdc, st.fonts.btn as *mut _);
             SetTextColor(hdc, COL_WHITE);
-            let tw = gdi::GetTextExtentPoint32_w(hdc, text);
+            let tw = gdi::text_extent(hdc, text);
             let tx = r.left + (r.right - r.left - tw.0) / 2;
             let ty = r.top + (r.bottom - r.top - tw.1) / 2;
             let mut pos = RECT { left: tx, top: ty, right: r.right, bottom: r.bottom };
@@ -1973,15 +2079,17 @@ mod native_toast {
 
     fn int(v: f32) -> i32 { v.round() as i32 }
 
-    fn hit_test(st: &CardState, x: i32, y: i32) -> i32 {
-        unsafe {
+    /// 命中测试：位置必须与 `paint_card` 使用**同一套**尺寸来源（真实客户区），
+    /// 否则估算高度与实际不符时，按钮会被画在窗口外、点了没反应。
+    fn hit_test(hwnd: HWND, st: &CardState, x: i32, y: i32) -> i32 {
+        let (w, h) = unsafe {
             let mut rc: RECT = std::mem::zeroed();
-            wm::GetClientRect(wm::GetParent(hwnd_of(st)), &mut rc);
-            let _ = rc;
-        }
-        // 布局参数重算（与 paint_card 相同）
+            wm::GetClientRect(hwnd, &mut rc);
+            (rc.right - rc.left, rc.bottom - rc.top)
+        };
+        let _ = (w, h);
         let s = st.scale;
-        let h = card_height(&st.data, st.scale);
+        let _ = card_height(&st.data, st.scale);
         let pad_l = int(PAD_L_PT as f32 * s);
         let bh = int(32.0 * s);
         let bw = int(88.0 * s);
@@ -1991,8 +2099,7 @@ mod native_toast {
             let bx2 = pad_l + bw + int(8.0 * s);
             if x >= bx2 && x <= bx2 + bw { return 2; }
         }
-        // 关闭 icon
-        let w = int(CARD_W_PT * st.scale);
+        // 关闭 icon：用真实客户区宽度（与绘制一致）
         let icon_r = int(11.0 * s);
         let iy = int(PAD_T_PT as f32 * s) + icon_r + int(2.0 * s);
         let ix2 = w - pad_l - icon_r;
@@ -2004,34 +2111,22 @@ mod native_toast {
         0
     }
 
-    fn hwnd_of(_st: &CardState) -> HWND { std::ptr::null_mut() }
 
     mod gdi {
-        use std::ffi::c_void;
-        use windows_sys::Win32::Graphics::Gdi::*;
+        // 直接用 windows_sys 的 GDI API（**不要**在这里再定义同名包装函数：
+        // 那会遮蔽 glob 导入的同名 API，变成无限递归 → 栈溢出 → toast 线程死掉，
+        // 表现为「窗口存在、位置正确、但内容永远是空白」）。
+        pub use windows_sys::Win32::Graphics::Gdi::{
+            BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateRoundRectRgn, DeleteDC,
+            DeleteObject, Ellipse, GetPixel, GetStockObject, GetTextExtentPoint32W, RoundRect,
+            SelectClipRgn, SelectObject,
+        };
 
-        pub unsafe fn CreateCompatibleDC(hdc: HDC) -> HDC { CreateCompatibleDC(hdc) }
-        pub unsafe fn CreateCompatibleBitmap(hdc: HDC, w: i32, h: i32) -> HBITMAP {
-            CreateCompatibleBitmap(hdc, w, h)
-        }
-        pub unsafe fn SelectObject(hdc: HDC, o: *mut c_void) -> *mut c_void { SelectObject(hdc, o) }
-        pub unsafe fn DeleteObject(o: *mut c_void) -> i32 { DeleteObject(o) }
-        pub unsafe fn DeleteDC(hdc: HDC) -> i32 { DeleteDC(hdc) }
-        pub unsafe fn CreateRoundRectRgn(l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> HRGN {
-            CreateRoundRectRgn(l, t, r, b, w, h)
-        }
-        pub unsafe fn SelectClipRgn(hdc: HDC, rgn: HRGN) -> i32 { SelectClipRgn(hdc, rgn) }
-        pub unsafe fn GetStockObject(i: i32) -> *mut c_void { GetStockObject(i) }
-        pub unsafe fn RoundRect(hdc: HDC, l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> i32 {
-            RoundRect(hdc, l, t, r, b, w, h)
-        }
-        pub unsafe fn BitBlt(hdc: HDC, x: i32, y: i32, w: i32, h: i32, s: HDC, sx: i32, sy: i32, rop: u32) -> i32 {
-            BitBlt(hdc, x, y, w, h, s, sx, sy, rop)
-        }
-        pub unsafe fn Ellipse(hdc: HDC, l: i32, t: i32, r: i32, b: i32) -> i32 {
-            Ellipse(hdc, l, t, r, b)
-        }
-        pub unsafe fn GetTextExtentPoint32_w(hdc: HDC, text: &str) -> (i32, i32) {
+        /// 文本像素尺寸（(宽, 高)）。
+        pub unsafe fn text_extent(
+            hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+            text: &str,
+        ) -> (i32, i32) {
             let mut s16: Vec<u16> = text.encode_utf16().collect();
             s16.push(0);
             let mut size = windows_sys::Win32::Foundation::SIZE { cx: 0, cy: 0 };

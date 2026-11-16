@@ -3962,7 +3962,7 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                     );
                 });
                 // right_to_left 布局：代码从上到下 = 屏幕从右到左。
-                // 目标显示顺序（左→右）：提醒一次、今日记录、立即同步、管理模板、设置。
+                // 目标显示顺序（左→右）：今日记录、提醒一次、立即同步、管理模板、设置。
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // —— 最右：设置 ——
                     if ui.add(button_white("设置")).clicked() {
@@ -3991,13 +3991,7 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                         ui.add_space(6.0);
                     }
 
-                    // —— 今日记录 ——
-                    if ui.add(button_primary("＋  今日记录")).clicked() {
-                        app.open_edit_state(EditState::new_record(Local::now().date_naive()));
-                    }
-                    ui.add_space(6.0);
-
-                    // —— 最左：提醒一次 ——
+                    // —— 提醒一次 ——
                     let firing_hint = app
                         .fire_hint_until
                         .is_some_and(|t| Instant::now() < t);
@@ -4008,6 +4002,12 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                         .clicked()
                     {
                         app.fire_reminders_now(ui.ctx());
+                    }
+                    ui.add_space(6.0);
+
+                    // —— 最左：今日记录 ——
+                    if ui.add(button_primary("＋  今日记录")).clicked() {
+                        app.open_edit_state(EditState::new_record(Local::now().date_naive()));
                     }
                 });
             });

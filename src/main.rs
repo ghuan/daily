@@ -7946,26 +7946,38 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                         let row_layout = egui::Layout::left_to_right(egui::Align::Min);
                         ui.allocate_ui_with_layout(row_size, row_layout, |ui| {
                             ui.spacing_mut().item_spacing.x = 6.0;
+                            // 标签区整体下沉：标签字号 11.5pt、标题 15pt，
+                            // 顶端对齐时小字会明显偏上，视觉上没有和标题首行"一条线"。
+                            // 下沉 (18.0-13.8)/2 ≈ 2pt 让两者视觉居中对齐。
+                            const TAG_DY: f32 = 2.0;
                             let (dot, _) =
                                 ui.allocate_exact_size(egui::vec2(7.0, 7.0), egui::Sense::hover());
-                            // horizontal_top 下色点贴顶，下移 4pt 让它与标签文字视觉居中对齐
+                            // 色点：与标签文字视觉居中（7pt 圆点在 11.5pt 行里居中）
                             ui.painter().circle_filled(
-                                dot.center() + egui::vec2(0.0, 4.0),
+                                dot.center() + egui::vec2(0.0, 3.0 + TAG_DY),
                                 3.5,
                                 tag_color,
                             );
-                            ui.label(
-                                RichText::new(if tag.is_empty() { "提醒" } else { tag })
-                                    .size(11.5)
-                                    .strong()
-                                    .color(tag_color),
-                            );
+                            ui.add_space(0.0);
+                            // 标签文字：用 add_space 撑出下沉量再画
+                            ui.vertical(|ui| {
+                                ui.add_space(TAG_DY);
+                                ui.label(
+                                    RichText::new(if tag.is_empty() { "提醒" } else { tag })
+                                        .size(11.5)
+                                        .strong()
+                                        .color(tag_color),
+                                );
+                            });
                             // 标签和标题之间用一个弱化的小横杠分隔。
-                            ui.label(
-                                RichText::new("·")
-                                    .size(11.5)
-                                    .color(Color32::from_rgb(110, 122, 158)),
-                            );
+                            ui.vertical(|ui| {
+                                ui.add_space(TAG_DY);
+                                ui.label(
+                                    RichText::new("·")
+                                        .size(11.5)
+                                        .color(Color32::from_rgb(110, 122, 158)),
+                                );
+                            });
                             // 标题：不截断，长标题换行显示全。
                             // 用 `add_sized` 限制最大宽度（右侧预留 CLOSE_AREA 给
                             // 两个绝对定位的关闭图标），这样标题仍在标签右侧、

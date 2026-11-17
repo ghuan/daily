@@ -8121,10 +8121,18 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
         let viewport_id = egui::ViewportId::from_hash_of(("record-toast", popup.record_id));
         // 建窗先放屏幕外：即便 Windows 合成器在映射瞬间用了默认位置，
         // 也闪在看不见的地方；首帧回调再移到右下角。
+        //
+        // 注意：不能用 -32000 这种极端值 —— egui-winit 会把它乘上
+        // zoom_factor（1.5 → -48000），winit/Windows 对超大负坐标会做
+        // clamp，反而把窗口夹回屏幕内（实测闪现在主窗口左上角附近）。
+        // 用「刚好在工作区右侧之外」的温和坐标（主屏右 + 100），
+        // 既不超范围、又在可视区外。
+        let work_right = work_px.max.x / ctx.pixels_per_point().max(0.5);
+        let offscreen = egui::pos2(work_right + 100.0, 0.0);
         let builder = egui::ViewportBuilder::default()
             .with_title("")
             .with_inner_size([CARD_W, h])
-            .with_position(egui::pos2(-32000.0, -32000.0))
+            .with_position(offscreen)
             .with_resizable(false)
             .with_decorations(false)
             .with_always_on_top()

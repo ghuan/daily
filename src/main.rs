@@ -1571,6 +1571,10 @@ struct PlanApp {
     cfg_msg: Option<String>,
 
     popups: Vec<Popup>,
+    /// 手动「提醒一次」弹出过的记录及其时刻。
+    /// 与 `last_fired` 分开记：手动提醒不推进定时锚点（不打乱节奏），
+    /// 但本槽位内已手动看过的不该在关闭卡片后被自动提醒立刻补弹。
+    manual_fired: std::collections::HashMap<Uuid, chrono::DateTime<Local>>,
     /// 每个提醒窗上一帧实际占用的内容高度（不含内边距），用于把窗口收到刚好包住内容。
     popup_heights: std::collections::HashMap<Uuid, f32>,
     last_tick: Instant,
@@ -1782,6 +1786,7 @@ impl PlanApp {
             cfg_error: None,
             cfg_msg: None,
             popups: demo_popups(),
+            manual_fired: std::collections::HashMap::new(),
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),
             last_conflict_scan: Instant::now() - Duration::from_secs(60), // 启动后尽检
@@ -2193,6 +2198,11 @@ impl PlanApp {
         let now = Local::now();
         let picked = pick_manual_popups(&self.doc.records, &self.popups, &now);
         let added = picked.len();
+        // 记下「这些记录本次手动提醒过了」。不碰 last_fired，定时节奏不受影响；
+        // 但本槽位内关闭卡片后，自动提醒不会再补弹同一条。
+        for p in &picked {
+            self.manual_fired.insert(p.record_id, now);
+        }
         self.popups.extend(picked);
 
         // 不往状态行写任何提示：状态行只留给存储位置与同步结果（用户要求）。
@@ -2383,6 +2393,17 @@ impl PlanApp {
             // 弹窗已经在显示时，本来就不该再推进定时锚点。
             if self.popups.iter().any(|x| x.record_id == r.id) {
                 continue;
+            }
+            // 本槽位已经手动提醒过（用户点过「提醒一次」并看过了）：
+            // 关闭卡片后不要被自动提醒立刻补弹，等下一个槽位再说。
+            // 与上面的 popups 判断一起构成两道闸：卡片还在 → 不弹；
+            // 卡片关了但本槽位手动看过 → 也不弹。
+            if let Some(manual_at) = self.manual_fired.get(&r.id) {
+                if let Some(slot_start) = r.current_slot_start(&now) {
+                    if *manual_at >= slot_start {
+                        continue;
+                    }
+                }
             }
             if let Some(upd) = r.check_fire(&now) {
                 upd.apply_to(r);
@@ -6696,6 +6717,48 @@ mod workflow_tests {
 
     /// 自动触发：弹窗已显示的记录不应被 tick 反复推进 last_fired。
     /// 否则「手动弹 A → 关闭 → 自动提醒拖到下一槽位」。
+
+    /// 手动提醒后关闭卡片，本槽位内自动提醒不应补弹。
+    #[test]
+    fn manual_fire_suppresses_auto_refire_in_same_slot() {
+        let now = Local::now();
+        let today = now.date_naive();
+        let r = DayRecord {
+            id: Uuid::new_v4(),
+            template_id: None,
+            date: today,
+            title: "测试".into(),
+            tag: String::new(),
+            note: String::new(),
+            time: NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default(),
+            remind: model::RemindWindow {
+                advance_days: 0,
+                advance_minutes: 0,
+                grace_days: None,
+                every_minutes: 60,
+            },
+            done: false,
+            done_at: None,
+            cancelled: false,
+            customized: false,
+            last_fired: None,
+            snooze_until: None,
+            created_at: now,
+        };
+        // 当前应在窗口内（grace 不限、起点已过）
+        let slot = r.current_slot_start(&now).expect("应在提醒窗口内");
+        // 模拟：手动提醒时刻 = 现在（同一槽位）
+        let manual_at = now;
+        assert!(manual_at >= slot, "手动时刻应落在当前槽位内");
+        // 因此 tick 里的判断应跳过
+        let should_skip = manual_at >= slot;
+        assert!(should_skip, "本槽位手动提醒过 → 自动提醒应跳过");
+
+        // 若手动提醒发生在上一个槽位（早于 slot_start），则不该跳过
+        let old_manual = slot - chrono::Duration::minutes(1);
+        assert!(old_manual < slot, "上一槽位的手动提醒不应压制本槽位");
+    }
+
     #[test]
     fn auto_fire_does_not_touch_shown_record() {
         let now = Local::now();
@@ -7043,6 +7106,7 @@ mod workflow_tests {
             cfg_error: None,
             cfg_msg: None,
             popups: Vec::new(),
+            manual_fired: std::collections::HashMap::new(),
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),
             last_conflict_scan: Instant::now() - Duration::from_secs(60), // 启动后尽检

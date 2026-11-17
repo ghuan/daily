@@ -11,7 +11,7 @@ mod store;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::{Datelike, Duration as ChronoDuration, Local, NaiveDate, NaiveTime, Timelike};
@@ -1575,6 +1575,10 @@ struct PlanApp {
     /// 与 `last_fired` 分开记：手动提醒不推进定时锚点（不打乱节奏），
     /// 但本槽位内已手动看过的不该在关闭卡片后被自动提醒立刻补弹。
     manual_fired: std::collections::HashMap<Uuid, chrono::DateTime<Local>>,
+    /// 已经发过 Visible(true) 的 toast viewport。
+    /// 用自建集合记录，而不是读 viewport.visible()——隐藏窗口下那个 API 返回
+    /// None，会让判断失效（上次失败的根因）。
+    shown_viewports: Arc<Mutex<std::collections::HashSet<egui::ViewportId>>>,
     /// 每个提醒窗上一帧实际占用的内容高度（不含内边距），用于把窗口收到刚好包住内容。
     popup_heights: std::collections::HashMap<Uuid, f32>,
     last_tick: Instant,
@@ -1787,6 +1791,7 @@ impl PlanApp {
             cfg_msg: None,
             popups: demo_popups(),
             manual_fired: std::collections::HashMap::new(),
+            shown_viewports: Arc::new(Mutex::new(std::collections::HashSet::new())),
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),
             last_conflict_scan: Instant::now() - Duration::from_secs(60), // 启动后尽检
@@ -7109,6 +7114,7 @@ mod workflow_tests {
             cfg_msg: None,
             popups: Vec::new(),
             manual_fired: std::collections::HashMap::new(),
+            shown_viewports: Arc::new(Mutex::new(std::collections::HashSet::new())),
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),
             last_conflict_scan: Instant::now() - Duration::from_secs(60), // 启动后尽检
@@ -8262,9 +8268,10 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
         let seed_pos = boxes_seed[slot];
 
         let viewport_id = egui::ViewportId::from_hash_of(("record-toast", popup.record_id));
-        // 直接在目标位置建窗（第一版思路）。
-        // 曾试过「先建在屏幕外、首帧再移动」，但那等于两次定位，
-        // 反而让闪烁更严重（用户实测）；回到一次到位更稳。
+        // 建窗可见性：首帧用 false 隐藏（画好第一帧内容再显示），
+        // 之后用 true，否则 builder 每帧的 visible=false 会把
+        // Visible(true) 命令覆盖回去（ViewportBuilder::patch 行为）。
+        let already_shown = app.shown_viewports.lock().unwrap().contains(&viewport_id);
         let builder = egui::ViewportBuilder::default()
             .with_title("")
             .with_inner_size([CARD_W, h])
@@ -8274,8 +8281,10 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
             .with_always_on_top()
             .with_window_level(egui::WindowLevel::AlwaysOnTop)
             .with_taskbar(false)
-            .with_active(false);
+            .with_active(false)
+            .with_visible(already_shown);
 
+        let shown_for_view = Arc::clone(&app.shown_viewports);
         ctx.show_viewport_immediate(viewport_id, builder, |vui, _| {
             let vctx = vui.ctx().clone();
             // 方案 A 的核心：用**弹窗这个窗口自己的** pixels_per_point 把
@@ -8302,6 +8311,15 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
             if needs_move {
                 vctx.send_viewport_cmd(ViewportCommand::OuterPosition(target));
             }
+            // 隐藏建窗 → 首帧内容/位置就绪后显示。
+            // 不读 viewport.visible()（隐藏时返回 None，会误判），
+            // 用自建集合记录已显示过的 viewport。
+            let mut shown = shown_for_view.lock().unwrap();
+            if !shown.contains(&viewport_id) {
+                vctx.send_viewport_cmd(ViewportCommand::Visible(true));
+                shown.insert(viewport_id);
+            }
+            drop(shown);
             egui::CentralPanel::default()
                 .frame(
                     egui::Frame::NONE
@@ -8571,6 +8589,16 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                 app.popup_heights.clear();
             }
         }
+    }
+    // 清理已关闭卡片的「已显示」标记：下次同一记录再弹时重新走
+    // 「隐藏建窗 → 首帧画好再显示」，保持一致的无闪效果。
+    {
+        let mut shown = app.shown_viewports.lock().unwrap();
+        shown.retain(|vid| {
+            app.popups.iter().any(|p| {
+                *vid == egui::ViewportId::from_hash_of(("record-toast", p.record_id))
+            })
+        });
     }
     ctx.request_repaint();
 }

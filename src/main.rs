@@ -8119,10 +8119,12 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
         let seed_pos = boxes_seed[slot];
 
         let viewport_id = egui::ViewportId::from_hash_of(("record-toast", popup.record_id));
+        // 建窗先放屏幕外：即便 Windows 合成器在映射瞬间用了默认位置，
+        // 也闪在看不见的地方；首帧回调再移到右下角。
         let builder = egui::ViewportBuilder::default()
             .with_title("")
             .with_inner_size([CARD_W, h])
-            .with_position(seed_pos)
+            .with_position(egui::pos2(-32000.0, -32000.0))
             .with_resizable(false)
             .with_decorations(false)
             .with_always_on_top()
@@ -8152,10 +8154,10 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
             // 首帧多发一次 SetWindowPos 反而让窗口先显示、再被移动，
             // 用户就看到"卡片先在屏幕中间、消失、再到右下角"。
             // 只有确实量到了位置且偏离 >1pt 时才纠正（DPI 变化等场景）。
-            let needs_move = vctx
-                .input(|i| i.viewport().outer_rect)
-                .map(|r| (r.min - target).length() > 1.0)
-                .unwrap_or(false);
+            let actual = vctx.input(|i| i.viewport().outer_rect.map(|r| (r.min.x, r.min.y)));
+            let needs_move = actual
+                .map(|(x, y)| (egui::pos2(x, y) - target).length() > 1.0)
+                .unwrap_or(true);  // 屏幕外建窗：首帧无论有无 rect 都必须移动
             if needs_move {
                 vctx.send_viewport_cmd(ViewportCommand::OuterPosition(target));
             }

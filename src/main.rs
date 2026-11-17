@@ -8146,10 +8146,16 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
             let child_ppp = vctx.pixels_per_point().max(0.5);
             let target =
                 toast_layout_points(work_px / child_ppp, CARD_W, MARGIN, GAP, &heights)[slot];
+            // 首帧 outer_rect 可能还是 None（窗口刚建、还没量到位置）：
+            // 此时**不要**发 OuterPosition —— seed_pos 与 target 在 100%/150%
+            // 缩放下都相等（已用日志证实），with_position 建窗时位置就是对的。
+            // 首帧多发一次 SetWindowPos 反而让窗口先显示、再被移动，
+            // 用户就看到"卡片先在屏幕中间、消失、再到右下角"。
+            // 只有确实量到了位置且偏离 >1pt 时才纠正（DPI 变化等场景）。
             let needs_move = vctx
                 .input(|i| i.viewport().outer_rect)
                 .map(|r| (r.min - target).length() > 1.0)
-                .unwrap_or(true);
+                .unwrap_or(false);
             if needs_move {
                 vctx.send_viewport_cmd(ViewportCommand::OuterPosition(target));
             }

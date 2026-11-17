@@ -8262,20 +8262,13 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
         let seed_pos = boxes_seed[slot];
 
         let viewport_id = egui::ViewportId::from_hash_of(("record-toast", popup.record_id));
-        // 建窗先放屏幕外：即便 Windows 合成器在映射瞬间用了默认位置，
-        // 也闪在看不见的地方；首帧回调再移到右下角。
-        //
-        // 注意：不能用 -32000 这种极端值 —— egui-winit 会把它乘上
-        // zoom_factor（1.5 → -48000），winit/Windows 对超大负坐标会做
-        // clamp，反而把窗口夹回屏幕内（实测闪现在主窗口左上角附近）。
-        // 用「刚好在工作区右侧之外」的温和坐标（主屏右 + 100），
-        // 既不超范围、又在可视区外。
-        let work_right = work_px.max.x / ctx.pixels_per_point().max(0.5);
-        let offscreen = egui::pos2(work_right + 100.0, 0.0);
+        // 直接在目标位置建窗（第一版思路）。
+        // 曾试过「先建在屏幕外、首帧再移动」，但那等于两次定位，
+        // 反而让闪烁更严重（用户实测）；回到一次到位更稳。
         let builder = egui::ViewportBuilder::default()
             .with_title("")
             .with_inner_size([CARD_W, h])
-            .with_position(offscreen)
+            .with_position(seed_pos)
             .with_resizable(false)
             .with_decorations(false)
             .with_always_on_top()
@@ -8299,16 +8292,13 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
             let child_ppp = vctx.pixels_per_point().max(0.5);
             let target =
                 toast_layout_points(work_px / child_ppp, CARD_W, MARGIN, GAP, &heights)[slot];
-            // 首帧 outer_rect 可能还是 None（窗口刚建、还没量到位置）：
-            // 此时**不要**发 OuterPosition —— seed_pos 与 target 在 100%/150%
-            // 缩放下都相等（已用日志证实），with_position 建窗时位置就是对的。
-            // 首帧多发一次 SetWindowPos 反而让窗口先显示、再被移动，
-            // 用户就看到"卡片先在屏幕中间、消失、再到右下角"。
-            // 只有确实量到了位置且偏离 >1pt 时才纠正（DPI 变化等场景）。
-            let actual = vctx.input(|i| i.viewport().outer_rect.map(|r| (r.min.x, r.min.y)));
-            let needs_move = actual
-                .map(|(x, y)| (egui::pos2(x, y) - target).length() > 1.0)
-                .unwrap_or(true);  // 屏幕外建窗：首帧无论有无 rect 都必须移动
+            // 只在位置确实偏了时才发 OuterPosition（第一版口径）：
+            // seed_pos 与 target 在 100%/150% 缩放下都相等（日志证实），
+            // 稳定状态下不重复发，避免 IME 候选窗被打断。
+            let needs_move = vctx
+                .input(|i| i.viewport().outer_rect)
+                .map(|r| (r.min - target).length() > 1.0)
+                .unwrap_or(true);
             if needs_move {
                 vctx.send_viewport_cmd(ViewportCommand::OuterPosition(target));
             }

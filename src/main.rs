@@ -330,6 +330,10 @@ mod theme {
     pub const OK_HOVER: Color32 = Color32::from_rgb(46, 181, 104);
     pub const OK_DIM: Color32 = Color32::from_rgb(226, 247, 237);
     pub const WARN: Color32 = Color32::from_rgb(224, 151, 44);
+    /// 「提醒一次」悬停态：橙色提亮一档。
+    pub const WARN_HOVER: Color32 = Color32::from_rgb(240, 166, 58);
+    /// 白底按钮悬停态：浅灰，比白色略深。
+    pub const WHITE_BTN_HOVER: Color32 = Color32::from_rgb(236, 239, 246);
     pub const DANGER: Color32 = Color32::from_rgb(224, 83, 94);
     pub const TOAST_BG: Color32 = Color32::from_rgb(31, 37, 56);
     /// 深色提醒窗里的次要按钮底色 / 描边（比窗底亮一档，带描边，看得见也点得准）。
@@ -2867,7 +2871,78 @@ fn clicked_outside_window(
     })
 }
 
-/// 主按钮（强调色）。
+/// 带悬停反馈的实心按钮的**配色**：返回 (常态, 悬停, 按下, 文字色, 描边)。
+///
+/// 注意：egui 的 `Button::fill()` 是固定色，不会随交互变化。要 hover 变色
+/// 必须走 `visuals.widgets.{inactive,hovered,active}.weak_bg_fill`（见
+/// `add_hover_button`）。这里只负责给色。
+fn button_tone(kind: ButtonTone) -> (Color32, Color32, Color32, Color32, Option<Color32>) {
+    match kind {
+        ButtonTone::Primary => (
+            theme::ACCENT,
+            theme::ACCENT_DIM,
+            theme::ACCENT_DIM,
+            Color32::WHITE,
+            None,
+        ),
+        ButtonTone::Warn => (
+            theme::WARN,
+            theme::WARN_HOVER,
+            theme::WARN_HOVER,
+            Color32::WHITE,
+            None,
+        ),
+        ButtonTone::White => (
+            Color32::WHITE,
+            theme::WHITE_BTN_HOVER,
+            theme::WHITE_BTN_HOVER,
+            theme::TEXT,
+            Some(theme::BORDER),
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ButtonTone {
+    Primary,
+    Warn,
+    White,
+}
+
+/// 画一个带 hover 状态的按钮：常态 / 悬停 / 按下三档底色不同。
+///
+/// 关键：不设置 `Button::fill`（那是固定色，永远不变），而是用 `ui.scope`
+/// 临时改写 visuals 的 weak_bg_fill 三档，让 egui 自己按交互状态选色 ——
+/// 这样文字仍由 Button 绘制，hover 时文字不会被覆盖（踩过的坑：用
+/// painter.rect_filled 盖一层会把文字一起盖掉）。
+fn add_hover_button(ui: &mut egui::Ui, text: &str, tone: ButtonTone) -> egui::Response {
+    let (normal, hover, active, text_color, stroke) = button_tone(tone);
+    ui.scope(|ui| {
+        let w = &mut ui.visuals_mut().widgets;
+        w.inactive.weak_bg_fill = normal;
+        w.hovered.weak_bg_fill = hover;
+        w.active.weak_bg_fill = active;
+        if let Some(sc) = stroke {
+            let s = egui::Stroke::new(1.0, sc);
+            w.inactive.bg_stroke = s;
+            w.hovered.bg_stroke = s;
+            w.active.bg_stroke = s;
+        } else {
+            let none = egui::Stroke::NONE;
+            w.inactive.bg_stroke = none;
+            w.hovered.bg_stroke = none;
+            w.active.bg_stroke = none;
+        }
+        ui.add(
+            egui::Button::new(RichText::new(text.to_owned()).strong().color(text_color))
+                .corner_radius(egui::CornerRadius::same(9))
+                .min_size(egui::vec2(0.0, 34.0)),
+        )
+    })
+    .inner
+}
+
+/// 主按钮（强调色），保留原函数供编辑/保存等弹窗内按钮使用（无 hover 需求）。
 fn button_primary(text: &str) -> egui::Button<'static> {
     egui::Button::new(
         RichText::new(text.to_owned())
@@ -3965,29 +4040,31 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                 // 目标显示顺序（左→右）：今日记录、提醒一次、立即同步、管理模板、设置。
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     // —— 最右：设置 ——
-                    if ui.add(button_white("设置")).clicked() {
+                    if add_hover_button(ui, "设置", ButtonTone::White).clicked() {
                         open_settings(app);
                     }
                     ui.add_space(6.0);
 
                     // —— 管理模板 ——
-                    if ui.add(button_white("管理模板")).clicked() {
+                    if add_hover_button(ui, "管理模板", ButtonTone::White).clicked() {
                         app.page = WorkspacePage::Templates;
                     }
                     ui.add_space(6.0);
 
                     // —— 立即同步（仅 Git 模式）——
                     if app.settings.kind == Kind::Git {
-                        if ui
-                            .add_enabled(
-                                !app.syncing,
-                                button_white(if app.syncing { "同步中…" } else { "立即同步" }),
+                        ui.add_enabled_ui(!app.syncing, |ui| {
+                            if add_hover_button(
+                                ui,
+                                if app.syncing { "同步中…" } else { "立即同步" },
+                                ButtonTone::White,
                             )
                             .clicked()
-                        {
-                            app.push_queue = None;
-                            app.manual_sync();
-                        }
+                            {
+                                app.push_queue = None;
+                                app.manual_sync();
+                            }
+                        });
                         ui.add_space(6.0);
                     }
 
@@ -3996,8 +4073,8 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                         .fire_hint_until
                         .is_some_and(|t| Instant::now() < t);
                     let label = if firing_hint { "无提醒" } else { "提醒一次" };
-                    if ui
-                        .add(button_filled(label, theme::WARN))
+                    let resp = add_hover_button(ui, label, ButtonTone::Warn);
+                    if resp
                         .on_hover_text("立即弹出当前处于提醒窗口内的记录（不影响定时）")
                         .clicked()
                     {
@@ -4006,7 +4083,7 @@ fn ui_calendar_workspace(app: &mut PlanApp, root: &mut egui::Ui) {
                     ui.add_space(6.0);
 
                     // —— 最左：今日记录 ——
-                    if ui.add(button_primary("＋  今日记录")).clicked() {
+                    if add_hover_button(ui, "＋  今日记录", ButtonTone::Primary).clicked() {
                         app.open_edit_state(EditState::new_record(Local::now().date_naive()));
                     }
                 });

@@ -453,12 +453,12 @@ impl DayRecord {
         })
     }
 
-    /// 当前时刻所处的提醒槽位起点；不在提醒窗口内返回 None。
+    /// 当前这次提醒窗口的起点；不在提醒窗口内返回 None。
     ///
-    /// 用于判断「本槽位是否已经被手动提醒过」：手动触发不写 `last_fired`
-    /// （那样会打乱定时节奏），但也不该在用户关闭卡片后被自动提醒立刻补弹。
-    /// 两条线索分开记，语义才不冲突。
-    pub fn current_slot_start(&self, now: &DateTime<Local>) -> Option<DateTime<Local>> {
+    /// 用于判断「本窗口内是否已经被手动提醒过」。**不能**改用槽位起点：
+    /// `check_fire` 对 `last_fired` 为空/过期的记录走「首响」分支，不参与
+    /// 槽位计算，两边口径不一致会漏拦（实测表现：「关掉又弹回来」）。
+    pub fn current_window_start(&self, now: &DateTime<Local>) -> Option<DateTime<Local>> {
         if self.cancelled || self.done {
             return None;
         }
@@ -472,10 +472,9 @@ impl DayRecord {
                 return None;
             }
         }
-        let step_min = self.remind.every_minutes.clamp(1, 10080) as i64;
-        let slots = (*now - start).num_minutes() / step_min;
-        Some(start + chrono::Duration::minutes(slots * step_min))
+        Some(start)
     }
+
 
     /// 此刻是否仍处于「提醒窗口」内（供提醒弹窗清理使用）。
     pub fn in_reminder_window(&self, now: &DateTime<Local>) -> bool {

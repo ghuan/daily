@@ -2394,15 +2394,19 @@ impl PlanApp {
             if self.popups.iter().any(|x| x.record_id == r.id) {
                 continue;
             }
-            // 本槽位已经手动提醒过（用户点过「提醒一次」并看过了）：
-            // 关闭卡片后不要被自动提醒立刻补弹，等下一个槽位再说。
-            // 与上面的 popups 判断一起构成两道闸：卡片还在 → 不弹；
-            // 卡片关了但本槽位手动看过 → 也不弹。
+            // 已经手动提醒过（用户点过「提醒一次」并看过了）：
+            // 关闭卡片后不要被自动提醒补弹。
+            //
+            // 这里**不能**用「手动时刻 >= 当前槽位起点」来判断 ——
+            // check_fire 的首响分支（last_fired 为 None 或早于窗口起点）
+            // 根本不走槽位计算，会无条件返回首响；两边口径不一致就拦不住，
+            // 用户就会看到「关掉又弹回来」。实测踩过。
+            //
+            // 正确口径：手动提醒发生在「当前这次提醒窗口内」就算已提醒过。
+            // 窗口换了（改了日期/时间，或进入下一次 occurrence）才允许自动再弹。
             if let Some(manual_at) = self.manual_fired.get(&r.id) {
-                if let Some(slot_start) = r.current_slot_start(&now) {
-                    if *manual_at >= slot_start {
-                        continue;
-                    }
+                if Some(*manual_at) >= r.current_window_start(&now) {
+                    continue;
                 }
             }
             if let Some(upd) = r.check_fire(&now) {
@@ -6746,17 +6750,15 @@ mod workflow_tests {
             created_at: now,
         };
         // 当前应在窗口内（grace 不限、起点已过）
-        let slot = r.current_slot_start(&now).expect("应在提醒窗口内");
-        // 模拟：手动提醒时刻 = 现在（同一槽位）
+        let win = r.current_window_start(&now).expect("应在提醒窗口内");
+        // 模拟：手动提醒时刻 = 现在（同一窗口内）→ tick 应跳过
         let manual_at = now;
-        assert!(manual_at >= slot, "手动时刻应落在当前槽位内");
-        // 因此 tick 里的判断应跳过
-        let should_skip = manual_at >= slot;
-        assert!(should_skip, "本槽位手动提醒过 → 自动提醒应跳过");
+        assert!(manual_at >= win, "手动时刻应落在当前窗口内");
+        assert!(manual_at >= win, "本窗口手动提醒过 → 自动提醒应跳过");
 
-        // 若手动提醒发生在上一个槽位（早于 slot_start），则不该跳过
-        let old_manual = slot - chrono::Duration::minutes(1);
-        assert!(old_manual < slot, "上一槽位的手动提醒不应压制本槽位");
+        // 手动提醒早于窗口起点（窗口换过一次）→ 不该压制
+        let old_manual = win - chrono::Duration::minutes(1);
+        assert!(old_manual < win, "上一窗口的手动提醒不应压制本窗口");
     }
 
     #[test]

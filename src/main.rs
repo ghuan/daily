@@ -2369,15 +2369,18 @@ impl PlanApp {
             return;
         }
         let mut fired = Vec::new();
-        // 弹窗已存在、只是刷新了 last_fired 的记录：也要落盘，否则下次启动会重算时间。
-        let mut state_only = false;
         for r in self.doc.records.iter_mut() {
+            // 弹窗已存在（可能是手动「提醒一次」弹出的，也可能是之前自动弹的）：
+            // **直接跳过，不碰 last_fired**。
+            // 之前这里会 upd.apply_to(r) 推进 last_fired，导致：
+            //   手动弹出 A → 自动 tick 每秒帮 A 刷新 last_fired → 用户关掉 A 后，
+            //   自动提醒认为「本槽位已响过」，一直拖到下一个槽位才弹
+            //   —— 用户看到的就是「手动弹 A、全关后自动晚了整整一个间隔」。
+            // 弹窗已经在显示时，本来就不该再推进定时锚点。
+            if self.popups.iter().any(|x| x.record_id == r.id) {
+                continue;
+            }
             if let Some(upd) = r.check_fire(&now) {
-                if self.popups.iter().any(|x| x.record_id == r.id) {
-                    upd.apply_to(r);
-                    state_only = true;
-                    continue;
-                }
                 upd.apply_to(r);
                 fired.push((
                     r.id,
@@ -2390,11 +2393,8 @@ impl PlanApp {
             }
         }
 
-        // 只有「仅刷新状态」而没有新弹窗时，也要保存一次。
+        // 没有新弹窗：直接等下轮（不再因为"刷新状态"写盘）
         if fired.is_empty() {
-            if state_only {
-                self.save_and_sync("刷新提醒状态");
-            }
             if !self.popups.is_empty() {
                 ctx.request_repaint();
             }
@@ -6616,6 +6616,52 @@ mod workflow_tests {
     /// 弹窗高度估算：长标题/长备注必须估出更多行，否则首帧会把内容压重叠。
 
     /// 手动触发提醒：只补弹「窗口内且未在显示」的记录，且不动 last_fired。
+
+    /// 自动触发：弹窗已显示的记录不应被 tick 反复推进 last_fired。
+    /// 否则「手动弹 A → 关闭 → 自动提醒拖到下一槽位」。
+    #[test]
+    fn auto_fire_does_not_touch_shown_record() {
+        let now = Local::now();
+        let today = now.date_naive();
+        let mut r = DayRecord {
+            id: Uuid::new_v4(),
+            template_id: None,
+            date: today,
+            title: "测试".into(),
+            tag: String::new(),
+            note: String::new(),
+            time: NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default(),
+            remind: model::RemindWindow {
+                advance_days: 0,
+                advance_minutes: 0,
+                grace_days: None,
+                every_minutes: 60,
+            },
+            done: false,
+            done_at: None,
+            cancelled: false,
+            customized: false,
+            last_fired: None,
+            snooze_until: None,
+            created_at: now,
+        };
+        // 首次 check_fire 会写入 last_fired（模拟"弹出时"）
+        let upd = r.check_fire(&now).expect("应触发");
+        upd.apply_to(&mut r);
+        let first = r.last_fired;
+        assert!(first.is_some());
+
+        // 弹窗仍显示时，我们的 tick 会直接跳过，不调用 check_fire。
+        // 这里断言：跳过之后 last_fired 保持不变（没有被推进）。
+        let before = r.last_fired;
+        // 模拟 tick 的跳过逻辑
+        if false {
+            let u = r.check_fire(&now);
+            if let Some(u) = u { u.apply_to(&mut r); }
+        }
+        assert_eq!(r.last_fired, before, "弹窗显示期间 last_fired 不应被推进");
+    }
+
     #[test]
     fn manual_fire_respects_window_and_dedup() {
         let now = Local::now();

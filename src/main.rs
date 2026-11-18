@@ -2307,6 +2307,16 @@ impl PlanApp {
 
     /// 每秒调度一次：只处理今天已经生成的记录。
     fn tick(&mut self, ctx: &egui::Context) {
+        // 同步进行中（尤其启动拉取 git reset --hard 覆盖数据文件）时，
+        // **绝不能**做提醒判定和落盘：此刻 self.doc 还是旧数据，若 check_fire
+        // 误判弹窗并 save_and_sync 落盘，会把「另一设备刚完成的状态」冲掉
+        // （实测：设备 A 完成记录 → 设备 B 启动 → 旧数据触发提醒并落盘 →
+        //  pull 完成后重载，完成状态被还原成未完成）。
+        // 等 poll_sync 把 syncing 清掉、doc 换成远端最新后再判定，下轮补上，
+        // 最多晚 1 秒，可接受。心跳 repaint 由 logic() 末尾维持，不受影响。
+        if self.syncing {
+            return;
+        }
         if self.last_tick.elapsed() < Duration::from_secs(1) {
             return;
         }

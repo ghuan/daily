@@ -6717,19 +6717,21 @@ mod workflow_tests {
             snooze_until: None,
             created_at: now,
         };
-        // 手动提醒：推进 last_fired = now
-        r.last_fired = Some(now);
+        // 用固定的槽位起点，避免测试跑在整点附近时「now+5min」跨槽位导致偶发失败。
+        let slot = r.current_slot_start(&now).expect("应在提醒窗口内");
+        // 手动提醒：推进 last_fired = 槽位起点 + 1 分钟（明确落在本槽位内）
+        let manual_at = slot + chrono::Duration::minutes(1);
+        r.last_fired = Some(manual_at);
 
         // 本槽位内（关掉卡片后）→ 不该补弹
-        let same_slot = now + chrono::Duration::minutes(5);
+        let same_slot = slot + chrono::Duration::minutes(2);
         assert!(
             r.check_fire(&same_slot).is_none(),
             "本槽位已手动提醒过，关掉后不该被自动补弹"
         );
 
         // 下一槽位 → 照常弹（延后不限的记录不会被永久压制）
-        let slot = r.current_slot_start(&now).expect("应在提醒窗口内");
-        let next_slot = slot + chrono::Duration::minutes(60) + chrono::Duration::minutes(5);
+        let next_slot = slot + chrono::Duration::minutes(60) + chrono::Duration::minutes(1);
         assert!(
             r.check_fire(&next_slot).is_some(),
             "下一槽位应照常自动弹（延后不限记录不能永久压制）"

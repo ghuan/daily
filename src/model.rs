@@ -476,6 +476,28 @@ impl DayRecord {
     }
 
 
+    /// 当前时刻所处的提醒槽位起点；不在窗口内返回 None。
+    ///
+    /// 与 `check_fire` 用**完全相同**的槽位算法（窗口起点 + N×间隔）。
+    /// 用于「手动提醒后本槽位内不重复弹、但下一槽位照常自动提醒」：
+    /// 「延后不限」的窗口可能长达几天，若用窗口起点判断会一次手动提醒
+    /// 抑制掉整个窗口后续所有小时的自动提醒（实测 bug）。
+    pub fn current_slot_start(&self, now: &DateTime<Local>) -> Option<DateTime<Local>> {
+        let occ = self.occurrence_at()?;
+        let (start, end) = self.remind.window(occ)?;
+        if *now < start {
+            return None;
+        }
+        if let Some(end) = end {
+            if *now > end {
+                return None;
+            }
+        }
+        let step_min = self.remind.every_minutes.clamp(1, 10080) as i64;
+        let slots = (*now - start).num_minutes() / step_min;
+        Some(start + chrono::Duration::minutes(slots * step_min))
+    }
+
     /// 此刻是否仍处于「提醒窗口」内（供提醒弹窗清理使用）。
     pub fn in_reminder_window(&self, now: &DateTime<Local>) -> bool {
         if self.cancelled || self.done {

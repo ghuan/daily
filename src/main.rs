@@ -2410,7 +2410,11 @@ impl PlanApp {
             // 正确口径：手动提醒发生在「当前这次提醒窗口内」就算已提醒过。
             // 窗口换了（改了日期/时间，或进入下一次 occurrence）才允许自动再弹。
             if let Some(manual_at) = self.manual_fired.get(&r.id) {
-                if Some(*manual_at) >= r.current_window_start(&now) {
+                // 用槽位起点判断（与 check_fire 同口径）：只抑制本提醒间隔内
+                // 的重复弹窗，下一槽位照常自动提醒。
+                // 之前误用窗口起点，导致「延后不限」的记录被一次手动提醒
+                // 抑制掉后续所有小时的自动提醒（实测 bug）。
+                if Some(*manual_at) >= r.current_slot_start(&now) {
                     continue;
                 }
             }
@@ -6754,16 +6758,16 @@ mod workflow_tests {
             snooze_until: None,
             created_at: now,
         };
-        // 当前应在窗口内（grace 不限、起点已过）
-        let win = r.current_window_start(&now).expect("应在提醒窗口内");
-        // 模拟：手动提醒时刻 = 现在（同一窗口内）→ tick 应跳过
-        let manual_at = now;
-        assert!(manual_at >= win, "手动时刻应落在当前窗口内");
-        assert!(manual_at >= win, "本窗口手动提醒过 → 自动提醒应跳过");
+        // 当前槽位起点（与 check_fire 同口径）
+        let slot = r.current_slot_start(&now).expect("应在提醒窗口内");
+        // 手动提醒时刻 = 现在（本槽位内）→ tick 跳过，不重复弹
+        assert!(now >= slot, "手动时刻应落在当前槽位内");
+        assert!(now >= slot, "本槽位手动提醒过 → 自动提醒应跳过");
 
-        // 手动提醒早于窗口起点（窗口换过一次）→ 不该压制
-        let old_manual = win - chrono::Duration::minutes(1);
-        assert!(old_manual < win, "上一窗口的手动提醒不应压制本窗口");
+        // 上一槽位手动提醒过 → 不应压制本槽位（延后不限的窗口可能长达几天，
+        // 之前误用窗口起点会把后续所有小时都吃掉，正是本次修复的 bug）
+        let old_manual = slot - chrono::Duration::minutes(1);
+        assert!(old_manual < slot, "上一槽位的手动提醒不应压制本槽位");
     }
 
     #[test]

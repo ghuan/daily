@@ -1571,10 +1571,6 @@ struct PlanApp {
     cfg_msg: Option<String>,
 
     popups: Vec<Popup>,
-    /// 手动「提醒一次」弹出过的记录及其时刻。
-    /// 与 `last_fired` 分开记：手动提醒不推进定时锚点（不打乱节奏），
-    /// 但本槽位内已手动看过的不该在关闭卡片后被自动提醒立刻补弹。
-    manual_fired: std::collections::HashMap<Uuid, chrono::DateTime<Local>>,
     /// 已经发过 Visible(true) 的 toast viewport。
     /// 用自建集合记录，而不是读 viewport.visible()——隐藏窗口下那个 API 返回
     /// None，会让判断失效（上次失败的根因）。
@@ -1790,7 +1786,6 @@ impl PlanApp {
             cfg_error: None,
             cfg_msg: None,
             popups: demo_popups(),
-            manual_fired: std::collections::HashMap::new(),
             shown_viewports: Arc::new(Mutex::new(std::collections::HashSet::new())),
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),
@@ -2203,10 +2198,19 @@ impl PlanApp {
         let now = Local::now();
         let picked = pick_manual_popups(&self.doc.records, &self.popups, &now);
         let added = picked.len();
-        // 记下「这些记录本次手动提醒过了」。不碰 last_fired，定时节奏不受影响；
-        // 但本槽位内关闭卡片后，自动提醒不会再补弹同一条。
+        // 手动弹窗与自动弹窗共用 last_fired 作为「本槽位已提醒」的唯一依据：
+        // 把 last_fired 推进到 now，check_fire 就认为本槽位已响过 —— 关掉卡片后
+        // 不会被自动补弹；下一槽位 slot_start 变大后照常自动弹。
+        // 这不打乱定时相位：槽位锚点是「窗口起点 + N×间隔」的整点，
+        // last_fired 只用于判断本槽位是否已响，推进到 now 仅影响当前槽位。
         for p in &picked {
-            self.manual_fired.insert(p.record_id, now);
+            if let Some(r) = self.doc.records.iter_mut().find(|r| r.id == p.record_id) {
+                r.last_fired = Some(now);
+            }
+        }
+        // 手动改了 last_fired → 需要落盘（与自动触发一致）。
+        if !picked.is_empty() {
+            self.save_and_sync("手动提醒");
         }
         self.popups.extend(picked);
 
@@ -2398,25 +2402,6 @@ impl PlanApp {
             // 弹窗已经在显示时，本来就不该再推进定时锚点。
             if self.popups.iter().any(|x| x.record_id == r.id) {
                 continue;
-            }
-            // 已经手动提醒过（用户点过「提醒一次」并看过了）：
-            // 关闭卡片后不要被自动提醒补弹。
-            //
-            // 这里**不能**用「手动时刻 >= 当前槽位起点」来判断 ——
-            // check_fire 的首响分支（last_fired 为 None 或早于窗口起点）
-            // 根本不走槽位计算，会无条件返回首响；两边口径不一致就拦不住，
-            // 用户就会看到「关掉又弹回来」。实测踩过。
-            //
-            // 正确口径：手动提醒发生在「当前这次提醒窗口内」就算已提醒过。
-            // 窗口换了（改了日期/时间，或进入下一次 occurrence）才允许自动再弹。
-            if let Some(manual_at) = self.manual_fired.get(&r.id) {
-                // 用槽位起点判断（与 check_fire 同口径）：只抑制本提醒间隔内
-                // 的重复弹窗，下一槽位照常自动提醒。
-                // 之前误用窗口起点，导致「延后不限」的记录被一次手动提醒
-                // 抑制掉后续所有小时的自动提醒（实测 bug）。
-                if Some(*manual_at) >= r.current_slot_start(&now) {
-                    continue;
-                }
             }
             if let Some(upd) = r.check_fire(&now) {
                 upd.apply_to(r);
@@ -2985,33 +2970,6 @@ fn button_primary(text: &str) -> egui::Button<'static> {
     )
     .fill(theme::ACCENT)
     .stroke(egui::Stroke::NONE)
-    .corner_radius(egui::CornerRadius::same(9))
-    .min_size(egui::vec2(0.0, 34.0))
-}
-
-/// 实心按钮，但用自定义底色（与 `button_primary` 同尺寸/圆角，仅颜色不同）。
-fn button_filled(text: &str, fill: Color32) -> egui::Button<'static> {
-    egui::Button::new(
-        RichText::new(text.to_owned())
-            .strong()
-            .color(Color32::WHITE),
-    )
-    .fill(fill)
-    .stroke(egui::Stroke::NONE)
-    .corner_radius(egui::CornerRadius::same(9))
-    .min_size(egui::vec2(0.0, 34.0))
-}
-
-/// 白底按钮：与「今日记录」同尺寸同圆角，白底深字。
-/// 用于「立即同步 / 管理模板 / 设置」这些次要但需要明确可点的操作。
-fn button_white(text: &str) -> egui::Button<'static> {
-    egui::Button::new(
-        RichText::new(text.to_owned())
-            .strong()
-            .color(theme::TEXT),
-    )
-    .fill(Color32::WHITE)
-    .stroke(egui::Stroke::new(1.0, theme::BORDER))
     .corner_radius(egui::CornerRadius::same(9))
     .min_size(egui::vec2(0.0, 34.0))
 }
@@ -6731,12 +6689,13 @@ mod workflow_tests {
     /// 自动触发：弹窗已显示的记录不应被 tick 反复推进 last_fired。
     /// 否则「手动弹 A → 关闭 → 自动提醒拖到下一槽位」。
 
-    /// 手动提醒后关闭卡片，本槽位内自动提醒不应补弹。
+    /// 手动提醒推进 last_fired：本槽位不补弹、下一槽位照常弹。
+    /// 同时覆盖「延后不限」记录不会被永久压制。
     #[test]
-    fn manual_fire_suppresses_auto_refire_in_same_slot() {
+    fn manual_fire_uses_last_fired_same_as_auto() {
         let now = Local::now();
         let today = now.date_naive();
-        let r = DayRecord {
+        let mut r = DayRecord {
             id: Uuid::new_v4(),
             template_id: None,
             date: today,
@@ -6747,7 +6706,7 @@ mod workflow_tests {
             remind: model::RemindWindow {
                 advance_days: 0,
                 advance_minutes: 0,
-                grace_days: None,
+                grace_days: None, // 延后不限
                 every_minutes: 60,
             },
             done: false,
@@ -6758,16 +6717,23 @@ mod workflow_tests {
             snooze_until: None,
             created_at: now,
         };
-        // 当前槽位起点（与 check_fire 同口径）
-        let slot = r.current_slot_start(&now).expect("应在提醒窗口内");
-        // 手动提醒时刻 = 现在（本槽位内）→ tick 跳过，不重复弹
-        assert!(now >= slot, "手动时刻应落在当前槽位内");
-        assert!(now >= slot, "本槽位手动提醒过 → 自动提醒应跳过");
+        // 手动提醒：推进 last_fired = now
+        r.last_fired = Some(now);
 
-        // 上一槽位手动提醒过 → 不应压制本槽位（延后不限的窗口可能长达几天，
-        // 之前误用窗口起点会把后续所有小时都吃掉，正是本次修复的 bug）
-        let old_manual = slot - chrono::Duration::minutes(1);
-        assert!(old_manual < slot, "上一槽位的手动提醒不应压制本槽位");
+        // 本槽位内（关掉卡片后）→ 不该补弹
+        let same_slot = now + chrono::Duration::minutes(5);
+        assert!(
+            r.check_fire(&same_slot).is_none(),
+            "本槽位已手动提醒过，关掉后不该被自动补弹"
+        );
+
+        // 下一槽位 → 照常弹（延后不限的记录不会被永久压制）
+        let slot = r.current_slot_start(&now).expect("应在提醒窗口内");
+        let next_slot = slot + chrono::Duration::minutes(60) + chrono::Duration::minutes(5);
+        assert!(
+            r.check_fire(&next_slot).is_some(),
+            "下一槽位应照常自动弹（延后不限记录不能永久压制）"
+        );
     }
 
     #[test]
@@ -7117,7 +7083,6 @@ mod workflow_tests {
             cfg_error: None,
             cfg_msg: None,
             popups: Vec::new(),
-            manual_fired: std::collections::HashMap::new(),
             shown_viewports: Arc::new(Mutex::new(std::collections::HashSet::new())),
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),

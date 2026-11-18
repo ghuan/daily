@@ -453,35 +453,13 @@ impl DayRecord {
         })
     }
 
-    /// 当前这次提醒窗口的起点；不在提醒窗口内返回 None。
-    ///
-    /// 用于判断「本窗口内是否已经被手动提醒过」。**不能**改用槽位起点：
-    /// `check_fire` 对 `last_fired` 为空/过期的记录走「首响」分支，不参与
-    /// 槽位计算，两边口径不一致会漏拦（实测表现：「关掉又弹回来」）。
-    pub fn current_window_start(&self, now: &DateTime<Local>) -> Option<DateTime<Local>> {
-        if self.cancelled || self.done {
-            return None;
-        }
-        let occ = self.occurrence_at()?;
-        let (start, end) = self.remind.window(occ)?;
-        if *now < start {
-            return None;
-        }
-        if let Some(end) = end {
-            if *now > end {
-                return None;
-            }
-        }
-        Some(start)
-    }
-
-
     /// 当前时刻所处的提醒槽位起点；不在窗口内返回 None。
     ///
     /// 与 `check_fire` 用**完全相同**的槽位算法（窗口起点 + N×间隔）。
     /// 用于「手动提醒后本槽位内不重复弹、但下一槽位照常自动提醒」：
     /// 「延后不限」的窗口可能长达几天，若用窗口起点判断会一次手动提醒
     /// 抑制掉整个窗口后续所有小时的自动提醒（实测 bug）。
+    #[allow(dead_code)] // 测试用于验证槽位口径；生产代码靠 check_fire 自身判断
     pub fn current_slot_start(&self, now: &DateTime<Local>) -> Option<DateTime<Local>> {
         let occ = self.occurrence_at()?;
         let (start, end) = self.remind.window(occ)?;

@@ -2722,7 +2722,9 @@ impl PlanApp {
                     done_at: None,
                     cancelled: false,
                     customized: true,
-                    last_fired: None,
+                    // 新建不立即弹：last_fired 设为当前时刻（本槽位算已提醒），
+                    // 下一个提醒槽位才弹（用户要求「新建后别马上弹」）。
+                    last_fired: Some(Local::now()),
                     snooze_until: None,
                     created_at: Local::now(),
                 });
@@ -2741,9 +2743,13 @@ impl PlanApp {
                     .is_some_and(|t| t.repeat.occurs_on(state.date))
                 {
                     if let Some(t) = self.doc.template(template_id) {
-                        self.doc
-                            .records
-                            .push(DayRecord::from_template(t, state.date));
+                        let mut rec = DayRecord::from_template(t, state.date);
+                        // 同「单日记录」：新建当天的记录不立刻弹，等下一槽位。
+                        // 注意只影响这条手动新建的，不影响模板批量铺其它日期。
+                        if rec.date <= Local::now().date_naive() {
+                            rec.last_fired = Some(Local::now());
+                        }
+                        self.doc.records.push(rec);
                     }
                 }
                 self.save_and_sync("新建提醒模板");
@@ -7245,6 +7251,27 @@ mod workflow_tests {
         assert_eq!(pending.0.note, "新备注");
         // last_fired 不变（提醒节奏不受编辑影响）
         assert_eq!(app.doc.record(id).unwrap().last_fired, Some(lf));
+    }
+
+    #[test]
+    fn new_record_does_not_fire_immediately() {
+        let mut app = base_app();
+        let today = Local::now().date_naive();
+        let mut state = EditState::new_record(today);
+        state.title = "新建今日计划".into();
+        state.hour = Local::now().hour();
+        state.target = None;
+        state.record_only = true;
+        app.edit = Some(state);
+        app.save_edit();
+
+        let r = app.doc.records.last().unwrap();
+        // 新建即视为本槽位已提醒过，check_fire 此刻不弹
+        assert!(r.last_fired.is_some(), "新建记录应有 last_fired");
+        assert!(
+            r.check_fire(&Local::now()).is_none(),
+            "新建当天记录不应立刻弹提醒"
+        );
     }
 
     #[test]

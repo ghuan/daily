@@ -2669,6 +2669,17 @@ impl PlanApp {
                     // 窗口整体挪动（改日期）的情况由 `check_fire` 里的
                     // `last_fired >= start` 判断自然处理。
                     r.snooze_until = None;
+
+                    // 如果这条记录的提醒卡片正开着，同步更新卡片内容快照
+                    // （标题/标签/备注/日期/时间），让它立刻反映刚保存的修改。
+                    // 只改展示字段，**不碰 last_fired**（提醒节奏不变）。
+                    if let Some(popup) = self.popups.iter_mut().find(|p| p.record_id == record_id) {
+                        popup.title = r.title.clone();
+                        popup.tag = r.tag.clone();
+                        popup.note = r.note.clone();
+                        popup.date = r.date;
+                        popup.time = r.time;
+                    }
                 }
                 self.save_and_sync("修改日期记录");
             }
@@ -7180,6 +7191,45 @@ mod workflow_tests {
         assert!(a.customized);
         assert_eq!(b.title, "喝水");
         assert_eq!(app.doc.template(template_id).unwrap().title, "喝水");
+    }
+
+    #[test]
+    fn editing_record_refreshes_open_popup_without_touching_last_fired() {
+        let mut app = base_app();
+        let mut state = EditState::new_record(date(2026, 11, 5));
+        state.title = "旧标题".into();
+        state.note = "旧备注".into();
+        state.hour = 9;
+        app.edit = Some(state);
+        app.save_edit();
+        let id = app.doc.records[0].id;
+
+        // 设一个 last_fired + 打开一条对应弹窗（模拟提醒正显示）
+        let lf = Local::now() - chrono::Duration::minutes(3);
+        app.doc.records[0].last_fired = Some(lf);
+        app.popups.push(Popup {
+            record_id: id,
+            title: "旧标题".into(),
+            tag: String::new(),
+            note: "旧备注".into(),
+            date: date(2026, 11, 5),
+            time: time(9, 0),
+        });
+
+        // 编辑这条记录：改标题/备注
+        let mut st = EditState::from_record(&app.doc.records[0]);
+        st.title = "新标题".into();
+        st.note = "新备注".into();
+        st.target = Some(EditTarget::Record(id));
+        app.edit = Some(st);
+        app.save_edit();
+
+        // 弹窗内容跟着更新
+        let popup = app.popups.iter().find(|p| p.record_id == id).unwrap();
+        assert_eq!(popup.title, "新标题");
+        assert_eq!(popup.note, "新备注");
+        // last_fired 不变（提醒节奏不受编辑影响）
+        assert_eq!(app.doc.record(id).unwrap().last_fired, Some(lf));
     }
 
     #[test]

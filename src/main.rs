@@ -1333,6 +1333,7 @@ fn grace_chip(text: &str, active: bool) -> egui::Button<'static> {
 // ============================== 提醒弹窗 ==============================
 
 /// 右下角独立通知小窗里的一条待处理提醒。
+#[derive(Clone)]
 struct Popup {
     record_id: Uuid,
     title: String,
@@ -1571,6 +1572,9 @@ struct PlanApp {
     cfg_msg: Option<String>,
 
     popups: Vec<Popup>,
+    /// 待重新弹出的卡片：编辑保存后先关掉旧卡片，隔一小段时间再用新内容弹出。
+    /// 存 Popup 快照 + 最早可弹出时刻（Instant），避免与旧 viewport 的销毁同帧冲突。
+    pending_repopups: Vec<(Popup, Instant)>,
     /// 已经发过 Visible(true) 的 toast viewport。
     /// 用自建集合记录，而不是读 viewport.visible()——隐藏窗口下那个 API 返回
     /// None，会让判断失效（上次失败的根因）。
@@ -1786,6 +1790,7 @@ impl PlanApp {
             cfg_error: None,
             cfg_msg: None,
             popups: demo_popups(),
+            pending_repopups: Vec::new(),
             shown_viewports: Arc::new(Mutex::new(std::collections::HashSet::new())),
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),
@@ -2670,15 +2675,22 @@ impl PlanApp {
                     // `last_fired >= start` 判断自然处理。
                     r.snooze_until = None;
 
-                    // 如果这条记录的提醒卡片正开着，同步更新卡片内容快照
-                    // （标题/标签/备注/日期/时间），让它立刻反映刚保存的修改。
-                    // 只改展示字段，**不碰 last_fired**（提醒节奏不变）。
-                    if let Some(popup) = self.popups.iter_mut().find(|p| p.record_id == record_id) {
-                        popup.title = r.title.clone();
-                        popup.tag = r.tag.clone();
-                        popup.note = r.note.clone();
-                        popup.date = r.date;
-                        popup.time = r.time;
+                    // 如果这条记录的提醒卡片正开着：关掉旧卡片，稍后用新内容重弹。
+                    // 不原地改快照 —— 那样重绘不一定刷新；重建窗口最可靠。
+                    // 先移除，ui_popups 会在 shown_viewports 里发现它消失，
+                    // 下一帧旧 viewport 被销毁；到期后再加入 popups 建新窗口。
+                    if let Some(pos) = self.popups.iter().position(|p| p.record_id == record_id) {
+                        self.popups.remove(pos);
+                        let fresh = Popup {
+                            record_id: r.id,
+                            title: r.title.clone(),
+                            tag: r.tag.clone(),
+                            note: r.note.clone(),
+                            date: r.date,
+                            time: r.time,
+                        };
+                        // 300ms 后重弹，给旧 viewport 一帧时间销毁。
+                        self.pending_repopups.push((fresh, Instant::now() + Duration::from_millis(300)));
                     }
                 }
                 self.save_and_sync("修改日期记录");
@@ -7106,6 +7118,7 @@ mod workflow_tests {
             cfg_error: None,
             cfg_msg: None,
             popups: Vec::new(),
+            pending_repopups: Vec::new(),
             shown_viewports: Arc::new(Mutex::new(std::collections::HashSet::new())),
             popup_heights: std::collections::HashMap::new(),
             last_tick: Instant::now(),
@@ -7224,10 +7237,12 @@ mod workflow_tests {
         app.edit = Some(st);
         app.save_edit();
 
-        // 弹窗内容跟着更新
-        let popup = app.popups.iter().find(|p| p.record_id == id).unwrap();
-        assert_eq!(popup.title, "新标题");
-        assert_eq!(popup.note, "新备注");
+        // 旧弹窗被关闭（不在 popups 里），新内容进入待重弹队列
+        assert!(app.popups.iter().all(|p| p.record_id != id), "旧弹窗应被关闭");
+        let pending = app.pending_repopups.iter().find(|(p, _)| p.record_id == id)
+            .expect("应有待重弹卡片");
+        assert_eq!(pending.0.title, "新标题");
+        assert_eq!(pending.0.note, "新备注");
         // last_fired 不变（提醒节奏不受编辑影响）
         assert_eq!(app.doc.record(id).unwrap().last_fired, Some(lf));
     }
@@ -8222,6 +8237,37 @@ fn toast_layout_points(
 }
 
 fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
+    // 编辑保存后待重弹的卡片：到点就加回 popups（此时旧 viewport 已销毁）。
+    // 用 drain 分出到期的，避免「到点后还要等下一个 popups 非空帧」的死锁。
+    if !app.pending_repopups.is_empty() {
+        let now = Instant::now();
+        let mut ready = Vec::new();
+        let mut waiting = Vec::new();
+        let now_dt = Local::now();
+        for (popup, at) in std::mem::take(&mut app.pending_repopups) {
+            if now >= at {
+                // 300ms 内可能发生了「完成记录」「关闭」等变化：
+                // 只有记录仍有效、仍在提醒窗口内、且没被其它路径弹着，才重弹。
+                let still_valid = app
+                    .doc
+                    .record(popup.record_id)
+                    .is_some_and(|r| r.in_reminder_window(&now_dt));
+                if still_valid
+                    && !app.popups.iter().any(|p| p.record_id == popup.record_id)
+                {
+                    ready.push(popup);
+                }
+            } else {
+                waiting.push((popup, at));
+            }
+        }
+        app.pending_repopups = waiting;
+        if !ready.is_empty() {
+            app.popups.extend(ready);
+            ctx.request_repaint();
+        }
+    }
+
     if app.popups.is_empty() {
         app.popup_heights.clear();
         return;

@@ -8295,6 +8295,22 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
         }
     }
 
+    // 关键：清理「已显示」标记必须放在 popups.is_empty() 判断**之前**。
+    // 原来放在函数末尾：当关闭最后一张卡片后 popups 变空，开头直接 return，
+    // 清理永远执行不到 —— shown_viewports 残留旧 id。后果：
+    //  1. 同一记录下次再弹时 already_shown=true，跳过「隐藏建窗→画好再显示」，
+    //     直接 with_visible(true) → 用户看到白屏卡片。
+    //  2. 旧 viewport 状态残留，关掉一条立刻又弹下一条（排队感）。
+    // 现在每次 ui_popups 调用都先按当前 popups 清理，保证状态不漂移。
+    {
+        let mut shown = app.shown_viewports.lock().unwrap();
+        shown.retain(|vid| {
+            app.popups.iter().any(|p| {
+                *vid == egui::ViewportId::from_hash_of(("record-toast", p.record_id))
+            })
+        });
+    }
+
     if app.popups.is_empty() {
         app.popup_heights.clear();
         return;
@@ -8693,16 +8709,6 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
                 app.popup_heights.clear();
             }
         }
-    }
-    // 清理已关闭卡片的「已显示」标记：下次同一记录再弹时重新走
-    // 「隐藏建窗 → 首帧画好再显示」，保持一致的无闪效果。
-    {
-        let mut shown = app.shown_viewports.lock().unwrap();
-        shown.retain(|vid| {
-            app.popups.iter().any(|p| {
-                *vid == egui::ViewportId::from_hash_of(("record-toast", p.record_id))
-            })
-        });
     }
     ctx.request_repaint();
 }

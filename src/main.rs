@@ -6777,6 +6777,47 @@ mod workflow_tests {
         );
     }
 
+    /// 弹窗开了很久才关：关闭时把 last_fired 推进到当前槽位，
+    /// 避免「19:00 弹的卡片 21:22 才关，被 tick 按 21:00 槽位补弹」。
+    #[test]
+    fn dismiss_after_long_open_does_not_refire_same_slot() {
+        let now = Local::now();
+        let today = now.date_naive();
+        let mut r = DayRecord {
+            id: Uuid::new_v4(),
+            template_id: None,
+            date: today,
+            title: "测试".into(),
+            tag: String::new(),
+            note: String::new(),
+            time: NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default(),
+            remind: model::RemindWindow {
+                advance_days: 0,
+                advance_minutes: 0,
+                grace_days: None,
+                every_minutes: 60,
+            },
+            done: false,
+            done_at: None,
+            cancelled: false,
+            customized: false,
+            // 模拟「2 小时前弹出的卡片一直开着」：last_fired 停在那一刻
+            last_fired: Some(now - chrono::Duration::hours(2)),
+            snooze_until: None,
+            created_at: now,
+        };
+        // 当前槽位起点（每 60 分钟一个槽位）
+        let slot = r.current_slot_start(&now).expect("应在提醒窗口内");
+        // 关闭动作：推进到当前槽位起点
+        assert!(r.last_fired.unwrap() < slot, "旧 last_fired 应落后于当前槽位");
+        r.last_fired = Some(slot);
+        // 本槽位不再弹（不再补弹同一条）
+        assert!(r.check_fire(&now).is_none(), "关闭后本槽位不应补弹");
+        // 下一槽位照常弹（延后不限的记录继续按间隔提醒）
+        let next = slot + chrono::Duration::minutes(60) + chrono::Duration::minutes(1);
+        assert!(r.check_fire(&next).is_some(), "下一槽位应照常弹");
+    }
+
     #[test]
     fn auto_fire_does_not_touch_shown_record() {
         let now = Local::now();
@@ -8700,15 +8741,50 @@ fn ui_popups(app: &mut PlanApp, ctx: &egui::Context) {
         })
         .collect();
 
+    // 关闭卡片时，把对应记录的 last_fired 推进到**当前槽位起点**：
+    // 表示「这个槽位我已经处理过了」。否则 tick 下一秒就会判定
+    // 「本槽位还没响过」而补弹同一条（实测：日志抓到 DISMISS 后
+    // 不到 1 秒 PUSH 同一条 —— 21:00 槽位在 19:00 时因弹窗一直开着
+    // 被跳过，关闭瞬间保护消失立即补弹）。
+    // 下一槽位 slot_start 前进后，照常自动提醒（延后不限的记录继续催）。
+    // Complete 走 set_done（完成后 check_fire 返回 None），无需处理。
+    let now_for_slot = Local::now();
+    let mut slot_advanced: Vec<Uuid> = Vec::new();
     for action in actions {
         match action {
-            PopupAction::Dismiss(id) => app.popups.retain(|p| p.record_id != id),
-            PopupAction::Complete(id) => app.set_done(id, true),
+            PopupAction::Dismiss(id) => {
+                if let Some(r) = app.doc.records.iter_mut().find(|x| x.id == id) {
+                    if let Some(slot) = r.current_slot_start(&now_for_slot) {
+                        if r.last_fired.is_none_or(|lf| lf < slot) {
+                            r.last_fired = Some(slot);
+                            slot_advanced.push(id);
+                        }
+                    }
+                }
+                app.popups.retain(|p| p.record_id != id)
+            },
+            PopupAction::Complete(id) => {
+                app.set_done(id, true)
+            },
             PopupAction::DismissAll => {
+                for p in app.popups.iter() {
+                    if let Some(r) = app.doc.records.iter_mut().find(|x| x.id == p.record_id) {
+                        if let Some(slot) = r.current_slot_start(&now_for_slot) {
+                            if r.last_fired.is_none_or(|lf| lf < slot) {
+                                r.last_fired = Some(slot);
+                                slot_advanced.push(p.record_id);
+                            }
+                        }
+                    }
+                }
                 app.popups.clear();
                 app.popup_heights.clear();
             }
         }
+    }
+    // last_fired 变了 → 落盘（与其它状态变更一致，否则重启后补弹）。
+    if !slot_advanced.is_empty() {
+        app.save_and_sync("关闭提醒卡片");
     }
     ctx.request_repaint();
 }
